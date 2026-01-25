@@ -28,8 +28,8 @@ class Config(BaseModel):
     
     # Настройки subscription сервера
     SUBSCRIPTION_HOST: str = os.getenv("SUBSCRIPTION_HOST", "0.0.0.0")
-    SUBSCRIPTION_PORT: int = Field(default=os.getenv("SUBSCRIPTION_PORT", 32909))
-    SUBSCRIPTION_BASE_URL: str = os.getenv("SUBSCRIPTION_BASE_URL", "http://localhost:32909")
+    SUBSCRIPTION_PORT: int = Field(default=os.getenv("SUBSCRIPTION_PORT", 35635))
+    SUBSCRIPTION_BASE_URL: str = os.getenv("SUBSCRIPTION_BASE_URL", "http://localhost:35635")
 
     # Настройки цен и скидок
     PRICES: Dict[int, Dict[str, int]] = {
@@ -65,13 +65,13 @@ class Config(BaseModel):
     @field_validator('SUBSCRIPTION_PORT', mode='before')
     def parse_subscription_port(cls, value):
         if value is None:
-            return 32909
+            return 35635
         if isinstance(value, str):
             value = value.strip()
             if not value:
-                return 32909
+                return 35635
             return int(value)
-        return int(value) if value else 32909
+        return int(value) if value else 35635
     
     def calculate_price(self, months: int) -> int:
         """Вычисляет итоговую стоимость с учетом скидки"""
