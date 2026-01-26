@@ -102,8 +102,12 @@ async def show_menu(bot: Bot, chat_id: int, message_id: int = None):
         f"**Имя профиля**: `{user.full_name}`\n"
         f"**Id**: `{user.telegram_id}`\n"
         f"**Подписка**: `{status}`\n"
-        f"**Дата окончания подписки**: `{expire_date}`"
+        f"**Дата окончания подписки**: `{expire_date}`\n"
     )
+    if status == "Активна":
+        text += f"Осталось только Подключить 👇"
+    else:
+        text += f"👇 Нажми кнопку Продлить"
     
     builder = InlineKeyboardBuilder()
     builder.button(text="💵 Продлить" if status=="Активна" else "💵 Оплатить", callback_data="renew_sub")
@@ -654,26 +658,29 @@ async def connect_profile(callback: CallbackQuery):
     text = (
         "🎉 **Ваш VPN профиль готов!**\n\n"
     )
+
+    text += (
+    "ℹ️ **Инструкция по подключению:**\n\n"
+    "📲 1. Скачайте приложение для вашей платформы\n"
+    "📋 2. Скопируйте ссылку и импортируйте в приложение\n"
+    "🔌 3. Активируйте соединение в приложении.\n\n"
+)
     
     if subscription_url:
         text += (
             "📋 **Два способа подключения:**\n\n"
-            "**1. Subscription URL (рекомендуется):**\n"
+            "🔄 **1. Subscription URL (рекомендуется):**\n\n"
+            "👇 **Нажми на ссылку и она скопируется в буфер обмена**\n\n"
+            
             f"`{subscription_url}`\n\n"
             "✅ Автоматическое обновление при изменении настроек сервера\n"
             "✅ Не нужно запрашивать новый профиль\n\n"
-            "**2. Прямое подключение (статическое):**\n"
+            "🔗 **2. Прямое подключение (статическое):**\n\n"
             f"`{vless_url}`\n\n"
         )
     else:
         text += f"`{vless_url}`\n\n"
     
-    text += (
-        "ℹ️ **Инструкция по подключению:**\n"
-        "1. Скачайте приложение для вашей платформы\n"
-        "2. Скопируйте ссылку и импортируйте в приложение\n"
-        "3. Активируйте соединение в приложении."
-    )
 
     builder = InlineKeyboardBuilder()
     builder.button(text='🖥️ Windows [V2RayN]', url='https://github.com/2dust/v2rayN/releases/download/7.13.8/v2rayN-windows-64-desktop.zip')
