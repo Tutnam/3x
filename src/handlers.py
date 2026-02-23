@@ -642,6 +642,7 @@ async def connect_profile(callback: CallbackQuery):
         return
     
     vless_url = generate_vless_url(profile_data)
+    subscription_url = f"{config.SUBSCRIPTION_BASE_URL}/{user.subscription_id}" if user.subscription_id else None
     
     text = (
         "🎉 **Ваш VPN профиль готов!**\n\n"
@@ -654,10 +655,16 @@ async def connect_profile(callback: CallbackQuery):
     "🔌 3. Активируйте соединение в приложении.\n\n"
 )
     
-    text += (
-        "👇 **Нажми на ссылку и она скопируется в буфер обмена**\n\n"
-        f"`{vless_url}`\n\n"
-    )
+    if subscription_url:
+        text += (
+            "👇 **Нажми на ссылку и она скопируется в буфер обмена**\n\n"
+            f"`{subscription_url}`\n\n"
+        )
+    else:
+        text += (
+            "👇 **Нажми на ссылку и она скопируется в буфер обмена**\n\n"
+            f"`{vless_url}`\n\n"
+        )
     
 
     builder = InlineKeyboardBuilder()
