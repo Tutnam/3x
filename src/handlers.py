@@ -3,7 +3,7 @@ import logging
 import json
 from datetime import datetime, timedelta
 from aiogram import Dispatcher, Router, F, Bot
-from aiogram.types import Message, CallbackQuery, LabeledPrice, PreCheckoutQuery, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import Message, CallbackQuery, LabeledPrice, PreCheckoutQuery
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -33,14 +33,7 @@ class AdminStates(StatesGroup):
     REMOVE_TIME_AMOUNT = State()
     SEND_MESSAGE_TARGET = State()
 
-def get_main_keyboard():
-    """Возвращает основную клавиатуру с кнопкой Меню"""
-    keyboard = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="📱 Меню")]],
-        resize_keyboard=True,
-        persistent=True
-    )
-    return keyboard
+
 
 def format_size(bytes_count: int) -> str:
     """Форматирует размер в человекочитаемый вид"""
@@ -156,17 +149,13 @@ async def start_cmd(message: Message, bot: Bot):
         )
         await message.answer(
             f"Добро пожаловать в VPN бота `{(await bot.get_me()).full_name}`!\nВам предоставлен **бесплатный** тестовый период на **3 дня**!", 
-            parse_mode='Markdown',
-            reply_markup=get_main_keyboard()
+            parse_mode='Markdown'
         )
         await asyncio.sleep(2)
     
     await show_menu(bot, message.from_user.id)
 
-@router.message(F.text == "📱 Меню")
-async def menu_button(message: Message, bot: Bot):
-    """Обработчик кнопки Меню"""
-    await show_menu(bot, message.from_user.id)
+
 
 @router.message(Command("menu"))
 async def menu_cmd(message: Message, bot: Bot):
@@ -653,7 +642,6 @@ async def connect_profile(callback: CallbackQuery):
         return
     
     vless_url = generate_vless_url(profile_data)
-    subscription_url = f"{config.SUBSCRIPTION_BASE_URL}/{user.subscription_id}" if user.subscription_id else None
     
     text = (
         "🎉 **Ваш VPN профиль готов!**\n\n"
@@ -666,20 +654,10 @@ async def connect_profile(callback: CallbackQuery):
     "🔌 3. Активируйте соединение в приложении.\n\n"
 )
     
-    if subscription_url:
-        text += (
-            "📋 **Два способа подключения:**\n\n"
-            "🔄 **1. Subscription URL (рекомендуется):**\n\n"
-            "👇 **Нажми на ссылку и она скопируется в буфер обмена**\n\n"
-            
-            f"`{subscription_url}`\n\n"
-            "✅ Автоматическое обновление при изменении настроек сервера\n"
-            "✅ Не нужно запрашивать новый профиль\n\n"
-            "🔗 **2. Прямое подключение (статическое):**\n\n"
-            f"`{vless_url}`\n\n"
-        )
-    else:
-        text += f"`{vless_url}`\n\n"
+    text += (
+        "👇 **Нажми на ссылку и она скопируется в буфер обмена**\n\n"
+        f"`{vless_url}`\n\n"
+    )
     
 
     builder = InlineKeyboardBuilder()
