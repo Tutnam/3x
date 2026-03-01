@@ -175,7 +175,7 @@ async def help_msg(callback: CallbackQuery):
     builder = InlineKeyboardBuilder()
     builder.button(text="⬅️ Назад", callback_data="back_to_menu")
     text = (
-        f"В разработке..."
+        f"Если у вас возникли проблемы с подключением, обратитесь в поддержку: @xRay_support_help"
     )
     await callback.message.answer(text, parse_mode='HTML', reply_markup=builder.as_markup())
 
