@@ -700,11 +700,11 @@ async def connect_profile(callback: CallbackQuery):
     
 
     builder = InlineKeyboardBuilder()
-    builder.button(text='🖥️ Windows [V2RayN]', url='https://github.com/2dust/v2rayN/releases/download/7.20.4/v2rayN-windows-64-desktop.zip')
+    builder.button(text='🖥️ Windows [Happ]', url='https://github.com/Happ-proxy/happ-desktop/releases/latest/download/setup-Happ.x64.exe')
     builder.button(text='🐧 Linux [NekoBox]', url='https://github.com/MatsuriDayo/nekoray/releases/download/4.0.1/nekoray-4.0.1-2024-12-12-debian-x64.deb')
     builder.button(text='🍎 Mac [V2RayU]', url='https://github.com/yanue/V2rayU/releases/download/v4.2.8/V2rayU-64.dmg')
     builder.button(text='🍏 iOS [HAPP Proxy]', url='https://apps.apple.com/ru/app/happ-proxy-utility-plus/id6746188973')
-    builder.button(text='🤖 Android [V2RayNG]', url='https://github.com/2dust/v2rayNG/releases/download/2.0.18/v2rayNG_2.0.18_arm64-v8a.apk')
+    builder.button(text='🤖 Android [Happ]', url='https://github.com/Happ-proxy/happ-android/releases/latest/download/Happ.apk')
     builder.button(text="⬅️ Назад", callback_data="back_to_menu")
     builder.adjust(2, 2, 1, 1)
 
