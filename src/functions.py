@@ -1,4 +1,5 @@
 import aiohttp
+import asyncio
 import uuid
 import json
 import logging
@@ -51,6 +52,18 @@ class XUIAPI:
         self.cookie_jar = aiohttp.CookieJar(unsafe=True)  # Разрешаем небезопасные куки
         self.auth_cookies = None
 
+    def _build_url(self, endpoint: str) -> str:
+        """Построение URL для API endpoint"""
+        base_url = config.XUI_API_URL.rstrip('/')
+        base_path = config.XUI_BASE_PATH.strip('/')
+        
+        if base_path:
+            # v3 стиль: https://domain.com/path/panel/api/endpoint
+            return f"{base_url}/{base_path}/panel/api{endpoint}"
+        else:
+            # Fallback: https://domain.com/panel/api/endpoint
+            return f"{base_url}/panel/api{endpoint}"
+
     async def login(self):
         """Аутентификация в 3x-UI API"""
         try:
@@ -60,49 +73,81 @@ class XUIAPI:
                 trust_env=True  # Доверять переменным окружения для прокси
             )
             
+            # Если есть API token - используем его (предпочтительный метод)
+            if config.XUI_API_TOKEN:
+                logger.info(f"ℹ️  Using API token for authentication")
+                # Добавим header с Authorization для всех последующих запросов
+                self.session.headers.update({
+                    "Authorization": f"Bearer {config.XUI_API_TOKEN}"
+                })
+                logger.info("✅ API token set for authorization")
+                return True
+            
+            # Если API token не установлен, пробуем логин через username/password
             auth_data = {
                 "username": config.XUI_USERNAME,
                 "password": config.XUI_PASSWORD
             }
             
-            # Формируем URL с учетом базового пути
+            # Формируем базовый URL
             base_url = config.XUI_API_URL.rstrip('/')
-            # base_path = config.XUI_BASE_PATH.strip('/')
-            # if base_path:
-            #     base_url = f"{base_url}/{base_path}"
-            login_url = f"{base_url}/login"
+            base_path = config.XUI_BASE_PATH.strip('/')
             
-            logger.info(f"ℹ️  Trying login to {login_url} with user: {config.XUI_USERNAME}")
+            # Варианты endpoint согласно официальной документации v3.2.0
+            # POST /login - "Authenticate with username + password and receive a session cookie"
+            endpoints = []
             
-            async with self.session.post(login_url, data=auth_data) as resp:
-                if resp.status != 200:
-                    logger.error(f"🛑 Login failed with status: {resp.status}")
-                    return False
-                
-                # Проверяем JSON ответ
+            if base_path:
+                # С base_path: /basepath/login
+                endpoints.append(f"{base_url}/{base_path}/login")
+            
+            # Альтернативные варианты
+            endpoints.extend([
+                f"{base_url}/login",  # Без base_path
+            ])
+            
+            for login_url in endpoints:
                 try:
-                    response = await resp.json()
-                    if response.get("success"):
-                        logger.info("✅ Login successful")
-                        # Сохраняем куки для последующих запросов
-                        self.auth_cookies = self.cookie_jar
-                        logger.debug(f"⚙️ Auth cookies: {self.auth_cookies}")
-                        return True
-                    else:
-                        logger.error(f"🛑 Login failed: {response.get('msg')}")
-                        return False
+                    logger.info(f"ℹ️  Trying login to {login_url} with user: {config.XUI_USERNAME}")
+                    
+                    async with self.session.post(login_url, data=auth_data, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                        if resp.status == 200:
+                            # Проверяем JSON ответ
+                            try:
+                                response = await resp.json()
+                                if response.get("success"):
+                                    logger.info("✅ Login successful")
+                                    # Сохраняем куки для последующих запросов
+                                    self.auth_cookies = self.cookie_jar
+                                    logger.debug(f"⚙️ Auth cookies: {self.auth_cookies}")
+                                    return True
+                                else:
+                                    logger.warning(f"⚠️ Login response not successful: {response.get('msg')}")
+                                    continue
+                            except Exception as e:
+                                logger.debug(f"JSON parse failed: {e}")
+                                # Если ответ не JSON, проверяем текст
+                                text = await resp.text()
+                                if "success" in text.lower():
+                                    logger.info("✅ Login successful (text response)")
+                                    self.auth_cookies = self.cookie_jar
+                                    logger.debug(f"⚙️ Auth cookies: {self.auth_cookies}")
+                                    return True
+                                continue
+                        else:
+                            text = await resp.text()
+                            logger.debug(f"⚠️ Endpoint {login_url} returned status {resp.status}")
+                            continue
+                except asyncio.TimeoutError:
+                    logger.warning(f"⚠️ Login timeout for {login_url}, trying next...")
+                    continue
                 except Exception as e:
-                    logger.debug(f"JSON parse failed, trying text: {e}")
-                    # Если ответ не JSON, проверяем текст
-                    text = await resp.text()
-                    if "success" in text.lower():
-                        logger.warning("⚠️ Login successful (text response)")
-                        # Сохраняем куки для последующих запросов
-                        self.auth_cookies = self.cookie_jar
-                        logger.debug(f"⚙️ Auth cookies: {self.auth_cookies}")
-                        return True
-                    logger.error(f"🛑 Login failed. Response text: {text[:100]}...")
-                    return False
+                    logger.debug(f"⚠️ Login error for {login_url}: {e}, trying next...")
+                    continue
+            
+            logger.error(f"🛑 Login failed with username/password. Please set XUI_API_TOKEN in .env file.")
+            logger.error(f"   API Token can be found in: Settings → Security → API Token")
+            return False
         except Exception as e:
             logger.exception(f"🛑 Login error: {e}")
             # Закрываем сессию при ошибке, чтобы избежать утечки ресурсов
@@ -114,11 +159,7 @@ class XUIAPI:
     async def get_inbound(self, inbound_id: int):
         """Получение данных инбаунда"""
         try:
-            base_url = config.XUI_API_URL.rstrip('/')
-            base_path = config.XUI_BASE_PATH.strip('/')
-            if base_path:
-                base_url = f"{base_url}/{base_path}"
-            url = f"{base_url}/api/inbounds/get/{inbound_id}"
+            url = self._build_url(f"/inbounds/get/{inbound_id}")
             
             logger.info(f"ℹ️  Getting inbound data from: {url}")
             logger.debug(f"⚙️ Using cookies: {self.cookie_jar}")
@@ -154,22 +195,24 @@ class XUIAPI:
     async def update_inbound(self, inbound_id: int, data: dict):
         """Обновление инбаунда"""
         try:
-            base_url = config.XUI_API_URL.rstrip('/')
-            base_path = config.XUI_BASE_PATH.strip('/')
-            if base_path:
-                base_url = f"{base_url}/{base_path}"
-            url = f"{base_url}/api/inbounds/update/{inbound_id}"
+            url = self._build_url(f"/inbounds/update/{inbound_id}")
             
             logger.info(f"ℹ️  Updating inbound at: {url}")
             
             async with self.session.post(url, json=data) as resp:
                 if resp.status != 200:
-                    logger.error(f"🛑 Update inbound failed with status: {resp.status}")
+                    text = await resp.text()
+                    logger.error(f"🛑 Update inbound failed with status: {resp.status}, response: {text[:200]}...")
                     return False
                 
                 try:
                     response = await resp.json()
-                    return response.get("success", False)
+                    success = response.get("success", False)
+                    if success:
+                        logger.info(f"✅ Inbound {inbound_id} updated successfully")
+                    else:
+                        logger.error(f"🛑 Update inbound failed: {response.get('msg', 'Unknown error')}")
+                    return success
                 except Exception as e:
                     text = await resp.text()
                     logger.debug(f"JSON parse failed: {e}, checking text response")
@@ -195,7 +238,13 @@ class XUIAPI:
         sni = reality_params.get("server_name") or config.REALITY_SNI
         
         try:
-            settings = json.loads(inbound["settings"])
+            raw_settings = inbound["settings"]
+            if isinstance(raw_settings, str):
+                settings = json.loads(raw_settings)
+            elif isinstance(raw_settings, dict):
+                settings = raw_settings.copy()
+            else:
+                raise TypeError(f"Ожидали 'settings' как str или dict, а得到了 {type(raw_settings).__name__}")
             clients = settings.get("clients", [])
             
             client_id = str(uuid.uuid4())
@@ -215,12 +264,8 @@ class XUIAPI:
                 "enable": True,
                 "tgId": "",
                 "subId": sub_id,  # Уникальный subscription ID
-                "reset": 0,
-                # Добавляем настройки для Reality
-                "fingerprint": config.REALITY_FINGERPRINT,
-                "publicKey": pbk,
-                "shortId": sid,
-                "spiderX": config.REALITY_SPIDER_X
+                "reset": 0
+                # Параметры Reality (fingerprint, publicKey, shortId, spiderX) находятся в streamSettings инбаунда
             }
             
             clients.append(new_client)
@@ -243,6 +288,7 @@ class XUIAPI:
             }
             
             if await self.update_inbound(config.INBOUND_ID, update_data):
+                logger.info(f"✅ Created VLESS profile for user {telegram_id}, email: {email}")
                 return {
                     "client_id": client_id,
                     "email": email,
@@ -260,6 +306,7 @@ class XUIAPI:
                     "sid": sid,
                     "spx": config.REALITY_SPIDER_X
                 }
+            logger.warning(f"⚠️ Failed to update inbound when creating profile for user {telegram_id}")
             return None
         except Exception as e:
             logger.exception(f"🛑 Create profile error: {e}")
@@ -301,12 +348,8 @@ class XUIAPI:
                 "enable": True,
                 "tgId": "",
                 "subId": sub_id,  # Уникальный subscription ID
-                "reset": 0,
-                # Добавляем настройки для Reality
-                "fingerprint": config.REALITY_FINGERPRINT,
-                "publicKey": pbk,
-                "shortId": sid,
-                "spiderX": config.REALITY_SPIDER_X
+                "reset": 0
+                # Параметры Reality (fingerprint, publicKey, shortId, spiderX) находятся в streamSettings инбаунда
             }
             
             clients.append(new_client)
@@ -329,6 +372,7 @@ class XUIAPI:
             }
             
             if await self.update_inbound(config.INBOUND_ID, update_data):
+                logger.info(f"✅ Created static client: {profile_name}")
                 return {
                     "client_id": client_id,
                     "email": profile_name,
@@ -346,6 +390,7 @@ class XUIAPI:
                     "sid": sid,
                     "spx": config.REALITY_SPIDER_X
                 }
+            logger.warning(f"⚠️ Failed to update inbound when creating static client: {profile_name}")
             return None
         except Exception as e:
             logger.exception(f"🛑 Create static client error: {e}")
@@ -395,6 +440,62 @@ class XUIAPI:
         except Exception as e:
             logger.exception(f"🛑 Delete client error: {e}")
             return False
+
+    async def toggle_client(self, email: str, enable: bool):
+        """Включение/отключение клиента по email (без удаления)"""
+        if not await self.login():
+            return False
+        
+        try:
+            inbound = await self.get_inbound(config.INBOUND_ID)
+            if not inbound:
+                return False
+            
+            raw_settings = inbound["settings"]
+            if isinstance(raw_settings, str):
+                settings = json.loads(raw_settings)
+            elif isinstance(raw_settings, dict):
+                settings = raw_settings.copy()  # копируем, чтобы не менять оригинал
+            else:
+                raise TypeError(f"Ожидали 'settings' как str или dict, а得到了 {type(raw_settings).__name__}")
+            clients = settings.get("clients", [])
+            
+            found = False
+            for client in clients:
+                if client["email"] == email:
+                    client["enable"] = enable
+                    found = True
+                    break
+            
+            if not found:
+                logger.warning(f"⚠️ Client {email} not found in inbound")
+                return False
+            
+            settings["clients"] = clients
+            
+            update_data = {
+                "up": inbound["up"],
+                "down": inbound["down"],
+                "total": inbound["total"],
+                "remark": inbound["remark"],
+                "enable": inbound["enable"],
+                "expiryTime": inbound["expiryTime"],
+                "listen": inbound["listen"],
+                "port": inbound["port"],
+                "protocol": inbound["protocol"],
+                "settings": json.dumps(settings, indent=2),
+                "streamSettings": inbound["streamSettings"],
+                "sniffing": inbound["sniffing"],
+            }
+            
+            result = await self.update_inbound(config.INBOUND_ID, update_data)
+            if result:
+                action = "enabled" if enable else "disabled"
+                logger.info(f"✅ Client {email} {action}")
+            return result
+        except Exception as e:
+            logger.exception(f"🛑 Toggle client error: {e}")
+            return False
     
     async def get_user_stats(self, email: str):
         """Получение статистики по email"""
@@ -403,11 +504,7 @@ class XUIAPI:
             return {"upload": 0, "download": 0}
         
         try:
-            base_url = config.XUI_API_URL.rstrip('/')
-            base_path = config.XUI_BASE_PATH.strip('/')
-            if base_path:
-                base_url = f"{base_url}/{base_path}"
-            url = f"{base_url}/api/inbounds/getClientTraffics/{email}"
+            url = self._build_url(f"/inbounds/getClientTraffics/{email}")
             
             async with self.session.get(url) as resp:
                 if resp.status != 200:
@@ -436,11 +533,7 @@ class XUIAPI:
             return {"upload": 0, "download": 0}
         
         try:
-            base_url = config.XUI_API_URL.rstrip('/')
-            base_path = config.XUI_BASE_PATH.strip('/')
-            if base_path:
-                base_url = f"{base_url}/{base_path}"
-            url = f"{base_url}/api/inbounds/get/{inbound_id}"
+            url = self._build_url(f"/inbounds/get/{inbound_id}")
             
             async with self.session.get(url) as resp:
                 if resp.status != 200:
@@ -468,11 +561,7 @@ class XUIAPI:
             return 0
         
         try:
-            base_url = config.XUI_API_URL.rstrip('/')
-            base_path = config.XUI_BASE_PATH.strip('/')
-            if base_path:
-                base_url = f"{base_url}/{base_path}"
-            url = f"{base_url}/api/inbounds/onlines"
+            url = self._build_url("/inbounds/onlines")
             
             async with self.session.post(url) as resp:
                 if resp.status != 200:
@@ -519,6 +608,20 @@ async def delete_client_by_email(email: str):
     api = XUIAPI()
     try:
         return await api.delete_client(email)
+    finally:
+        await api.close()
+
+async def enable_client_by_email(email: str):
+    api = XUIAPI()
+    try:
+        return await api.toggle_client(email, enable=True)
+    finally:
+        await api.close()
+
+async def disable_client_by_email(email: str):
+    api = XUIAPI()
+    try:
+        return await api.toggle_client(email, enable=False)
     finally:
         await api.close()
 

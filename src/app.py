@@ -7,7 +7,7 @@ from config import config
 from aiogram import Bot, Dispatcher
 from handlers import setup_handlers
 from datetime import datetime, timedelta
-from functions import delete_client_by_email
+from functions import delete_client_by_email, disable_client_by_email
 from database import Session, User, init_db, get_all_users, delete_user_profile
 from subscription_server import start_subscription_server
 
@@ -47,20 +47,30 @@ async def check_subscriptions(bot: Bot):
                 if user.subscription_end <= now and user.vless_profile_data:
                     try:
                         profile = json.loads(user.vless_profile_data)
-                        # Удаляем из инбаунда
-                        success = await delete_client_by_email(profile["email"])
+                        # Пропускаем если уже отключали
+                        if profile.get("disabled"):
+                            continue
+                        
+                        # Отключаем клиента в инбаунде (не удаляем)
+                        success = await disable_client_by_email(profile["email"])
                         if success:
-                            # Удаляем профиль из БД
-                            await delete_user_profile(user.telegram_id)
+                            # Помечаем профиль как отключённый
+                            profile["disabled"] = True
+                            with Session() as session:
+                                db_user = session.query(User).filter_by(telegram_id=user.telegram_id).first()
+                                if db_user:
+                                    db_user.vless_profile_data = json.dumps(profile)
+                                    db_user.notified = True
+                                    session.commit()
                             
                             await bot.send_message(
                                 user.telegram_id,
-                                "❌ Ваша подписка истекла! Профиль VPN был удален. Продлите подписку, чтобы создать новый."
+                                "❌ Ваша подписка истекла! VPN профиль отключён. Продлите подписку, чтобы восстановить доступ."
                             )
                         else:
-                            logger.warning(f"⚠️ Failed to delete client {profile['email']} from inbound")
+                            logger.warning(f"⚠️ Failed to disable client {profile['email']}")
                     except Exception as e:
-                        logger.warning(f"⚠️ Deletion error: {e}")
+                        logger.warning(f"⚠️ Disable error: {e}")
         except Exception as e:
             logger.warning(f"⚠️ Subscription check error: {e}")
         
