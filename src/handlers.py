@@ -1,4 +1,5 @@
 import asyncio
+import html
 import logging
 import json
 from datetime import datetime, timedelta
@@ -14,7 +15,7 @@ from database import (
     get_all_users, create_static_profile, get_static_profiles, 
     User, Session, get_user_stats as db_user_stats
 )
-from functions import create_vless_profile, delete_client_by_email, generate_vless_url, get_user_stats, create_static_client, get_global_stats, get_online_users
+from functions import create_vless_profile, delete_client_by_email, enable_client_by_email, generate_vless_url, get_user_stats, create_static_client, get_global_stats, get_online_users
 
 logger = logging.getLogger(__name__)
 
@@ -264,6 +265,21 @@ async def process_successful_payment(message: Message, bot: Bot):
             success = await update_subscription(message.from_user.id, months)
             suffix = "месяц" if months == 1 else "месяца" if months in (2,3,4) else "месяцев"
             if success:
+                # Если профиль уже есть — включаем его обратно
+                if user.vless_profile_data:
+                    try:
+                        profile = json.loads(user.vless_profile_data)
+                        await enable_client_by_email(profile["email"])
+                        # Убираем флаг disabled
+                        profile.pop("disabled", None)
+                        with Session() as session:
+                            db_user = session.query(User).filter_by(telegram_id=message.from_user.id).first()
+                            if db_user:
+                                db_user.vless_profile_data = json.dumps(profile)
+                                session.commit()
+                    except Exception as e:
+                        logger.error(f"🛑 Failed to re-enable client: {e}")
+                
                 await message.answer(
                     f"✅ Оплата прошла успешно! Ваша подписка {action_type} на {months} {suffix}.\n\n"
                     "Спасибо за покупку! 🎉"
@@ -442,8 +458,8 @@ async def handle_user_list_active(callback: CallbackQuery):
     text = "👤 <b>Пользователи с активной подпиской:</b>\n\n"
     for user in users:
         expire_date = user.subscription_end.strftime("%d.%m.%Y %H:%M")
-        username = f"@{user.username}" if user.username else "none"
-        user_line = f"• {user.full_name} ({username} | <code>{user.telegram_id}</code>) - до <code>{expire_date}</code>\n"
+        username = f"@{html.escape(user.username)}" if user.username else "none"
+        user_line = f"• {html.escape(user.full_name)} ({username} | <code>{user.telegram_id}</code>) - до <code>{expire_date}</code>\n"
         
         # Если текст становится слишком длинным, отправляем текущую часть и начинаем новую
         if len(text) + len(user_line) > MAX_MESSAGE_LENGTH:
@@ -465,8 +481,8 @@ async def handle_user_list_inactive(callback: CallbackQuery):
     
     text = "👤 <b>Пользователи без подписки:</b>\n\n"
     for user in users:
-        username = f"@{user.username}" if user.username else "none"
-        user_line = f"• {user.full_name} ({username} | <code>{user.telegram_id}</code>)\n"
+        username = f"@{html.escape(user.username)}" if user.username else "none"
+        user_line = f"• {html.escape(user.full_name)} ({username} | <code>{user.telegram_id}</code>)\n"
         
         # Если текст становится слишком длинным, отправляем текущую часть и начинаем новую
         if len(text) + len(user_line) > MAX_MESSAGE_LENGTH:
@@ -635,6 +651,21 @@ async def connect_profile(callback: CallbackQuery):
         else:
             await callback.message.answer("🛑 Ошибка при создании профиля. Попробуйте позже.")
             return
+    else:
+        # Профиль уже есть — включаем его обратно на случай если был отключён
+        try:
+            profile_data = json.loads(user.vless_profile_data)
+            await enable_client_by_email(profile_data["email"])
+            # Убираем флаг disabled
+            profile_data.pop("disabled", None)
+            with Session() as session:
+                db_user = session.query(User).filter_by(telegram_id=user.telegram_id).first()
+                if db_user:
+                    db_user.vless_profile_data = json.dumps(profile_data)
+                    session.commit()
+            user = await get_user(user.telegram_id)
+        except Exception as e:
+            logger.error(f"🛑 Failed to re-enable client on connect: {e}")
     
     profile_data = safe_json_loads(user.vless_profile_data, default={})
     if not profile_data:
@@ -649,10 +680,11 @@ async def connect_profile(callback: CallbackQuery):
     )
 
     text += (
-    "ℹ️ **Инструкция по подключению:**\n\n"
-    "📲 1. Скачайте приложение для вашей платформы\n"
-    "📋 2. Скопируйте ссылку и импортируйте в приложение\n"
-    "🔌 3. Активируйте соединение в приложении.\n\n"
+        "ℹ️ **Инструкция по подключению:**\n\n"
+        "1️⃣ Скачайте приложение 📲\n"
+        "2️⃣ Скопируйте ссылку и импортируйте её 📋\n"
+        "3️⃣ Нажмите на три точки в правом верхнем углу экрана ︙ и выберите 'обновить подписку'\n"
+        "4️⃣ Активируйте соединение в приложении 🔌\n\n"
 )
     
     if subscription_url:
@@ -668,11 +700,11 @@ async def connect_profile(callback: CallbackQuery):
     
 
     builder = InlineKeyboardBuilder()
-    builder.button(text='🖥️ Windows [V2RayN]', url='https://github.com/2dust/v2rayN/releases/download/7.13.8/v2rayN-windows-64-desktop.zip')
+    builder.button(text='🖥️ Windows [V2RayN]', url='https://github.com/2dust/v2rayN/releases/download/7.20.4/v2rayN-windows-64-desktop.zip')
     builder.button(text='🐧 Linux [NekoBox]', url='https://github.com/MatsuriDayo/nekoray/releases/download/4.0.1/nekoray-4.0.1-2024-12-12-debian-x64.deb')
-    builder.button(text='🍎 Mac [V2RayU]', url='https://github.com/yanue/V2rayU/releases/download/v4.2.6/V2rayU-64.dmg ')
-    builder.button(text='🍏 iOS [V2RayTun]', url='https://apps.apple.com/ru/app/v2raytun/id6476628951')
-    builder.button(text='🤖 Android [V2RayNG]', url='https://github.com/2dust/v2rayNG/releases/download/1.10.16/v2rayNG_1.10.16_arm64-v8a.apk')
+    builder.button(text='🍎 Mac [V2RayU]', url='https://github.com/yanue/V2rayU/releases/download/v4.2.8/V2rayU-64.dmg')
+    builder.button(text='🍏 iOS [HAPP Proxy]', url='https://apps.apple.com/ru/app/happ-proxy-utility-plus/id6746188973')
+    builder.button(text='🤖 Android [V2RayNG]', url='https://github.com/2dust/v2rayNG/releases/download/2.0.18/v2rayNG_2.0.18_arm64-v8a.apk')
     builder.button(text="⬅️ Назад", callback_data="back_to_menu")
     builder.adjust(2, 2, 1, 1)
 

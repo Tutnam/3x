@@ -12,6 +12,7 @@ class Config(BaseModel):
     XUI_BASE_PATH: str = os.getenv("XUI_BASE_PATH", "/panel")
     XUI_USERNAME: str = os.getenv("XUI_USERNAME", "admin")
     XUI_PASSWORD: str = os.getenv("XUI_PASSWORD", "admin")
+    XUI_API_TOKEN: str = os.getenv("XUI_API_TOKEN", "")  # Опциональный API token для авторизации
     XUI_HOST: str = os.getenv("XUI_HOST", "your-server.com")
     XUI_SERVER_NAME: str = os.getenv("XUI_SERVER_NAME", "domain.com")
     VLESS_PUBLIC_HOST: str = os.getenv("VLESS_PUBLIC_HOST", "")
