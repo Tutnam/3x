@@ -15,7 +15,7 @@ from database import (
     get_all_users, create_static_profile, get_static_profiles, 
     User, Session, get_user_stats as db_user_stats
 )
-from functions import create_vless_profile, delete_client_by_email, enable_client_by_email, generate_vless_url, get_user_stats, create_static_client, get_global_stats, get_online_users
+from functions import create_vless_profile, delete_client_by_email, enable_client_by_email, generate_vless_url, get_user_stats, create_static_client, get_global_stats, get_online_users, get_client_links_by_email
 
 logger = logging.getLogger(__name__)
 
@@ -570,20 +570,28 @@ async def static_profile_add(callback: CallbackQuery, state: FSMContext):
 async def process_static_profile_name(message: Message, state: FSMContext):
     profile_name = message.text
     profile_data = await create_static_client(profile_name)
-    
+
     if profile_data:
-        vless_url = generate_vless_url(profile_data)
-        await create_static_profile(profile_name, vless_url)
+        # В v3.2.0 ссылки (по всем привязанным инбаундам) генерирует панель
+        links = await get_client_links_by_email(profile_data["email"])
+        if not links:
+            await message.answer("Профиль создан, но не удалось получить ссылки. Попробуйте позже.")
+            await state.clear()
+            return
+        # В БД храним ссылки построчно
+        await create_static_profile(profile_name, "\n".join(links))
         profiles = await get_static_profiles()
+        id = None
         for profile in profiles:
             if profile.name == profile_name:
                 id = profile.id
         builder = InlineKeyboardBuilder()
         builder.button(text="🗑️ Удалить", callback_data=f"delete_static_{id}")
-        await message.answer(f"Профиль создан!\n\n`{vless_url}`", reply_markup=builder.as_markup(), parse_mode='Markdown')
+        links_block = "\n".join(f"`{link}`" for link in links)
+        await message.answer(f"Профиль создан!\n\n{links_block}", reply_markup=builder.as_markup(), parse_mode='Markdown')
     else:
         await message.answer("Ошибка при создании профиля")
-    
+
     await state.clear()
 
 @router.callback_query(F.data == "static_profile_list")
@@ -596,8 +604,11 @@ async def static_profile_list(callback: CallbackQuery):
     for profile in profiles:
         builder = InlineKeyboardBuilder()
         builder.button(text="🗑️ Удалить", callback_data=f"delete_static_{profile.id}")
+        links_block = "\n".join(
+            f"`{line}`" for line in (profile.vless_url or "").splitlines() if line.strip()
+        ) or f"`{profile.vless_url}`"
         await callback.message.answer(
-            f"**{profile.name}**\n`{profile.vless_url}`", 
+            f"**{profile.name}**\n{links_block}",
             reply_markup=builder.as_markup(), parse_mode='Markdown'
         )
 

@@ -5,7 +5,7 @@ from aiohttp import web
 from datetime import datetime
 from config import config
 from database import get_user_by_subscription_id
-from functions import XUIAPI, generate_vless_url
+from functions import get_client_links_by_email
 
 logger = logging.getLogger(__name__)
 
@@ -46,54 +46,32 @@ async def handle_subscription(request):
             return web.Response(text="No profile configured", status=404)
         
         logger.info(f"✅ Profile data exists")
-        
-        # Парсим данные профиля
+
+        # Парсим данные профиля, чтобы получить email клиента
         import json
         logger.info(f"🔍 Parsing profile data...")
         profile_data = json.loads(user.vless_profile_data)
-        logger.info(f"✅ Profile data parsed successfully")
-        
-        # Получаем актуальные настройки из 3x-UI
-        logger.info(f"🔍 Connecting to 3x-UI API...")
-        api = XUIAPI()
-        try:
-            login_success = await api.login()
-            logger.info(f"🔍 Login result: {login_success}")
-            
-            if login_success:
-                logger.info(f"🔍 Fetching inbound {config.INBOUND_ID}...")
-                inbound = await api.get_inbound(config.INBOUND_ID)
-                
-                if inbound:
-                    logger.info(f"✅ Inbound data received")
-                    # Обновляем параметры Reality из актуальных настроек
-                    from functions import _extract_reality_from_inbound
-                    reality_params = _extract_reality_from_inbound(inbound)
-                    
-                    # Обновляем профиль актуальными данными
-                    profile_data['port'] = inbound['port']
-                    profile_data['sni'] = reality_params.get('server_name') or config.REALITY_SNI
-                    profile_data['pbk'] = reality_params.get('public_key') or config.REALITY_PUBLIC_KEY
-                    profile_data['sid'] = reality_params.get('short_id') or config.REALITY_SHORT_ID
-                    profile_data['remark'] = inbound.get('remark', profile_data.get('remark', ''))
-                    logger.info(f"✅ Profile data updated with current inbound settings")
-                else:
-                    logger.warning(f"⚠️ Could not fetch inbound, using cached profile data")
-            else:
-                logger.warning(f"⚠️ Login failed, using cached profile data")
-        except Exception as api_error:
-            logger.error(f"🛑 API error: {api_error}", exc_info=True)
-        finally:
-            await api.close()
-        
-        # Генерируем VLESS URL с актуальными настройками
-        logger.info(f"🔍 Generating VLESS URL...")
-        vless_url = generate_vless_url(profile_data)
-        logger.info(f"✅ VLESS URL generated: {vless_url[:50]}...")
-        
-        # Кодируем в base64 (стандарт для subscription URL)
+        email = profile_data.get("email")
+        logger.info(f"✅ Profile data parsed successfully (email: {email})")
+
+        if not email:
+            logger.warning(f"⚠️ No email in profile data for user {user.telegram_id}")
+            return web.Response(text="No profile configured", status=404)
+
+        # В v3.2.0 готовые ссылки (для всех привязанных инбаундов и протоколов)
+        # генерирует сама панель — забираем их через /clients/links/{email}.
+        logger.info(f"🔍 Fetching client links from 3x-UI for {email}...")
+        links = await get_client_links_by_email(email)
+        logger.info(f"✅ Got {len(links)} link(s) from panel")
+
+        if not links:
+            logger.warning(f"⚠️ No links returned for {email}")
+            return web.Response(text="No profile configured", status=404)
+
+        # Кодируем в base64 (стандарт subscription URL — строки через перевод строки)
         logger.info(f"🔍 Encoding to base64...")
-        encoded = base64.b64encode(vless_url.encode('utf-8')).decode('utf-8')
+        payload = "\n".join(links)
+        encoded = base64.b64encode(payload.encode('utf-8')).decode('utf-8')
         logger.info(f"✅ Encoded successfully. Length: {len(encoded)} bytes")
         
         logger.info(f"✅ Subscription served for user {user.telegram_id}")

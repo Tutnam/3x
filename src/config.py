@@ -13,6 +13,7 @@ class Config(BaseModel):
     XUI_USERNAME: str = os.getenv("XUI_USERNAME", "admin")
     XUI_PASSWORD: str = os.getenv("XUI_PASSWORD", "admin")
     XUI_API_TOKEN: str = os.getenv("XUI_API_TOKEN", "")  # Опциональный API token для авторизации
+    INBOUND_IDS: List[int] = Field(default_factory=list)  # Инбаунды, к которым привязывается новый клиент (v3.2.0)
     XUI_HOST: str = os.getenv("XUI_HOST", "your-server.com")
     XUI_SERVER_NAME: str = os.getenv("XUI_SERVER_NAME", "domain.com")
     VLESS_PUBLIC_HOST: str = os.getenv("VLESS_PUBLIC_HOST", "")
@@ -52,6 +53,13 @@ class Config(BaseModel):
             return int(value)
         return value or 15
 
+    @field_validator('INBOUND_IDS', mode='before')
+    def parse_inbound_ids(cls, value):
+        """Парсит список инбаундов из строки "1,2,3,4,9,10,11,12"."""
+        if isinstance(value, str):
+            return [int(i) for i in value.split(",") if i.strip()]
+        return value or []
+
     @field_validator('VLESS_PUBLIC_PORT', mode='before')
     def parse_vless_public_port(cls, value):
         if value is None:
@@ -88,8 +96,14 @@ class Config(BaseModel):
 
 config = Config(
     ADMINS=os.getenv("ADMINS", ""),
-    INBOUND_ID=os.getenv("INBOUND_ID", 15)
+    INBOUND_ID=os.getenv("INBOUND_ID", 15),
+    INBOUND_IDS=os.getenv("INBOUND_IDS", "")
 )
+
+# Примечание: если INBOUND_IDS пуст — включается авто-режим: при создании клиента
+# бот запрашивает актуальный список инбаундов у панели и привязывает клиента ко
+# всем клиентским инбаундам (см. XUIAPI.get_all_inbound_ids / _create_client).
+# Если INBOUND_IDS задан — он используется как явное закрепление списка.
 
 def validate_config():
     """Проверяет наличие обязательных переменных окружения"""
