@@ -318,6 +318,32 @@ class XUIAPI:
             logger.exception(f"🛑 Toggle client error: {e}")
             return False
 
+    async def set_client_subscription(self, email: str, expiry_ms: int, enable: bool = True) -> bool:
+        """Синхронизация срока подписки и состояния клиента.
+
+        Выставляет клиенту ``expiryTime`` (мс, 0=безлимит) и ``enable`` одним
+        обновлением. Используется при продлении/оплате/изменении срока админом.
+        """
+        try:
+            client = await self.get_client(email)
+            if not client:
+                logger.warning(f"⚠️ Client {email} not found, cannot set subscription")
+                return False
+
+            for ro in ("id", "createdAt", "updatedAt", "traffic", "inboundIds", "group"):
+                client.pop(ro, None)
+
+            client["expiryTime"] = int(expiry_ms or 0)
+            client["enable"] = enable
+
+            result = await self.update_client(email, client)
+            if result:
+                logger.info(f"✅ Client {email} subscription set: expiry_ms={expiry_ms}, enable={enable}")
+            return result
+        except Exception as e:
+            logger.exception(f"🛑 Set client subscription error: {e}")
+            return False
+
     # ----------------------------------------------------------------------
     # Инбаунды / статистика
     # ----------------------------------------------------------------------
@@ -410,10 +436,11 @@ class XUIAPI:
     # Высокоуровневые операции
     # ----------------------------------------------------------------------
 
-    async def _create_client(self, email: str, telegram_id: int = 0):
+    async def _create_client(self, email: str, telegram_id: int = 0, expiry_ms: int = 0):
         """Общая логика создания клиента и привязки ко всем INBOUND_IDS.
 
-        Возвращает profile_data в формате, совместимом со старыми записями БД.
+        ``expiry_ms`` — момент истечения подписки в миллисекундах (Unix epoch);
+        0 = безлимит. Возвращает profile_data в формате, совместимом с БД.
         """
         client_id = str(uuid.uuid4())
         sub_id = secrets.token_urlsafe(16)
@@ -426,7 +453,7 @@ class XUIAPI:
             "flow": (config.REALITY_FLOW or ""),
             "limitIp": 0,
             "totalGB": 0,
-            "expiryTime": 0,
+            "expiryTime": int(expiry_ms or 0),
             "enable": True,
             "tgId": telegram_id or 0,
             "reset": 0,
@@ -465,25 +492,25 @@ class XUIAPI:
             "spx": config.REALITY_SPIDER_X,
         }
 
-    async def create_vless_profile(self, telegram_id: int):
-        """Создание профиля для пользователя бота."""
+    async def create_vless_profile(self, telegram_id: int, expiry_ms: int = 0):
+        """Создание профиля для пользователя бота (expiry_ms — срок в мс, 0=безлимит)."""
         if not await self.login():
             logger.error("🛑 Login failed before creating profile")
             return None
         email = f"user_{telegram_id}_{random.randint(1000, 9999)}"
-        profile = await self._create_client(email, telegram_id=telegram_id)
+        profile = await self._create_client(email, telegram_id=telegram_id, expiry_ms=expiry_ms)
         if profile:
-            logger.info(f"✅ Created VLESS profile for user {telegram_id}, email: {email}")
+            logger.info(f"✅ Created VLESS profile for user {telegram_id}, email: {email}, expiry_ms={expiry_ms}")
         else:
             logger.warning(f"⚠️ Failed to create profile for user {telegram_id}")
         return profile
 
-    async def create_static_client(self, profile_name: str):
-        """Создание статического клиента (имя = email)."""
+    async def create_static_client(self, profile_name: str, expiry_ms: int = 0):
+        """Создание статического клиента (имя = email; expiry_ms 0=безлимит)."""
         if not await self.login():
             logger.error("🛑 Login failed before creating static client")
             return None
-        profile = await self._create_client(profile_name, telegram_id=0)
+        profile = await self._create_client(profile_name, telegram_id=0, expiry_ms=expiry_ms)
         if profile:
             logger.info(f"✅ Created static client: {profile_name}")
         else:
@@ -506,18 +533,29 @@ class XUIAPI:
 # Публичные функции-обёртки (контракт для handlers.py / app.py / subscription_server.py)
 # --------------------------------------------------------------------------
 
-async def create_vless_profile(telegram_id: int):
+async def create_vless_profile(telegram_id: int, expiry_ms: int = 0):
     api = XUIAPI()
     try:
-        return await api.create_vless_profile(telegram_id)
+        return await api.create_vless_profile(telegram_id, expiry_ms=expiry_ms)
     finally:
         await api.close()
 
 
-async def create_static_client(profile_name: str):
+async def create_static_client(profile_name: str, expiry_ms: int = 0):
     api = XUIAPI()
     try:
-        return await api.create_static_client(profile_name)
+        return await api.create_static_client(profile_name, expiry_ms=expiry_ms)
+    finally:
+        await api.close()
+
+
+async def set_client_subscription_by_email(email: str, expiry_ms: int, enable: bool = True):
+    """Синхронизировать срок (мс) и состояние клиента в панели."""
+    api = XUIAPI()
+    try:
+        if not await api.login():
+            return False
+        return await api.set_client_subscription(email, expiry_ms, enable=enable)
     finally:
         await api.close()
 
