@@ -6,12 +6,17 @@ import logging
 import random
 import secrets
 from config import config
-from urllib.parse import urljoin
 from urllib.parse import quote
 
 logger = logging.getLogger(__name__)
 
+
 def _extract_reality_from_inbound(inbound: dict) -> dict:
+    """Вытаскивает Reality-параметры из streamSettings инбаунда.
+
+    Оставлено для обратной совместимости и как fallback для generate_vless_url.
+    В v3.2.0 готовые ссылки берутся напрямую у панели (/clients/links/{email}).
+    """
     try:
         stream_settings_raw = inbound.get("streamSettings") or "{}"
         stream_settings = json.loads(stream_settings_raw) if isinstance(stream_settings_raw, str) else (stream_settings_raw or {})
@@ -46,96 +51,89 @@ def _extract_reality_from_inbound(inbound: dict) -> dict:
         "server_name": server_name,
     }
 
+
 class XUIAPI:
+    """Клиент 3x-ui API v3.2.0.
+
+    В v3.2.0 клиент — отдельная сущность, к которой привязываются инбаунды
+    (many-to-many). Управление идёт через эндпоинты /panel/api/clients/*:
+    add / update / del / get / links / traffic / onlines.
+    """
+
     def __init__(self):
         self.session = None
         self.cookie_jar = aiohttp.CookieJar(unsafe=True)  # Разрешаем небезопасные куки
         self.auth_cookies = None
 
     def _build_url(self, endpoint: str) -> str:
-        """Построение URL для API endpoint"""
+        """Построение URL для API endpoint."""
         base_url = config.XUI_API_URL.rstrip('/')
         base_path = config.XUI_BASE_PATH.strip('/')
-        
+
         if base_path:
             # v3 стиль: https://domain.com/path/panel/api/endpoint
             return f"{base_url}/{base_path}/panel/api{endpoint}"
-        else:
-            # Fallback: https://domain.com/panel/api/endpoint
-            return f"{base_url}/panel/api{endpoint}"
+        # Fallback: https://domain.com/panel/api/endpoint
+        return f"{base_url}/panel/api{endpoint}"
 
     async def login(self):
-        """Аутентификация в 3x-UI API"""
+        """Аутентификация в 3x-ui API.
+
+        Предпочтительный способ для v3.2.0 — API token (Bearer). Если токен не
+        задан, делаем fallback на логин по username/password (cookie-сессия).
+        """
         try:
-            # Создаем новую сессию с общей куки-банкой
+            # Создаём новую сессию с общей куки-банкой
             self.session = aiohttp.ClientSession(
                 cookie_jar=self.cookie_jar,
                 trust_env=True  # Доверять переменным окружения для прокси
             )
-            
-            # Если есть API token - используем его (предпочтительный метод)
+
+            # Если есть API token — используем его (предпочтительный метод)
             if config.XUI_API_TOKEN:
-                logger.info(f"ℹ️  Using API token for authentication")
-                # Добавим header с Authorization для всех последующих запросов
+                logger.info("ℹ️  Using API token for authentication")
                 self.session.headers.update({
                     "Authorization": f"Bearer {config.XUI_API_TOKEN}"
                 })
                 logger.info("✅ API token set for authorization")
                 return True
-            
-            # Если API token не установлен, пробуем логин через username/password
+
+            # Иначе — логин через username/password
             auth_data = {
                 "username": config.XUI_USERNAME,
                 "password": config.XUI_PASSWORD
             }
-            
-            # Формируем базовый URL
+
             base_url = config.XUI_API_URL.rstrip('/')
             base_path = config.XUI_BASE_PATH.strip('/')
-            
-            # Варианты endpoint согласно официальной документации v3.2.0
-            # POST /login - "Authenticate with username + password and receive a session cookie"
+
             endpoints = []
-            
             if base_path:
-                # С base_path: /basepath/login
                 endpoints.append(f"{base_url}/{base_path}/login")
-            
-            # Альтернативные варианты
-            endpoints.extend([
-                f"{base_url}/login",  # Без base_path
-            ])
-            
+            endpoints.append(f"{base_url}/login")
+
             for login_url in endpoints:
                 try:
                     logger.info(f"ℹ️  Trying login to {login_url} with user: {config.XUI_USERNAME}")
-                    
                     async with self.session.post(login_url, data=auth_data, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                         if resp.status == 200:
-                            # Проверяем JSON ответ
                             try:
                                 response = await resp.json()
                                 if response.get("success"):
                                     logger.info("✅ Login successful")
-                                    # Сохраняем куки для последующих запросов
                                     self.auth_cookies = self.cookie_jar
-                                    logger.debug(f"⚙️ Auth cookies: {self.auth_cookies}")
                                     return True
-                                else:
-                                    logger.warning(f"⚠️ Login response not successful: {response.get('msg')}")
-                                    continue
+                                logger.warning(f"⚠️ Login response not successful: {response.get('msg')}")
+                                continue
                             except Exception as e:
                                 logger.debug(f"JSON parse failed: {e}")
-                                # Если ответ не JSON, проверяем текст
                                 text = await resp.text()
                                 if "success" in text.lower():
                                     logger.info("✅ Login successful (text response)")
                                     self.auth_cookies = self.cookie_jar
-                                    logger.debug(f"⚙️ Auth cookies: {self.auth_cookies}")
                                     return True
                                 continue
                         else:
-                            text = await resp.text()
                             logger.debug(f"⚠️ Endpoint {login_url} returned status {resp.status}")
                             continue
                 except asyncio.TimeoutError:
@@ -144,451 +142,369 @@ class XUIAPI:
                 except Exception as e:
                     logger.debug(f"⚠️ Login error for {login_url}: {e}, trying next...")
                     continue
-            
-            logger.error(f"🛑 Login failed with username/password. Please set XUI_API_TOKEN in .env file.")
-            logger.error(f"   API Token can be found in: Settings → Security → API Token")
+
+            logger.error("🛑 Login failed with username/password. Set XUI_API_TOKEN in .env (Settings → Security → API Token).")
             return False
         except Exception as e:
             logger.exception(f"🛑 Login error: {e}")
-            # Закрываем сессию при ошибке, чтобы избежать утечки ресурсов
             if self.session:
                 await self.session.close()
                 self.session = None
             return False
 
-    async def get_inbound(self, inbound_id: int):
-        """Получение данных инбаунда"""
-        try:
-            url = self._build_url(f"/inbounds/get/{inbound_id}")
-            
-            logger.info(f"ℹ️  Getting inbound data from: {url}")
-            logger.debug(f"⚙️ Using cookies: {self.cookie_jar}")
-            
-            async with self.session.get(url) as resp:
-                logger.debug(f"⚙️ Response status: {resp.status}")
-                logger.debug(f"⚙️ Response cookies: {resp.cookies}")
-                
-                if resp.status != 200:
-                    text = await resp.text()
-                    logger.error(f"🛑 Get inbound failed: status={resp.status}, response={text[:100]}...")
-                    return None
-                
-                try:
-                    data = await resp.json()
-                    if data.get("success"):
-                        obj = data.get("obj")
-                        if obj:
-                            logger.info(f'📋 Available inbound keys: {list(obj.keys())}')
-                        logger.debug(f'⚙️ Data: {str(data)}')
-                        return obj
-                    else:
-                        logger.error(f"🛑 Get inbound failed: {data.get('msg')}")
-                        return None
-                except Exception as e:
-                    text = await resp.text()
-                    logger.error(f"🛑 Get inbound JSON parse error: {e}. Response: {text[:100]}...")
-                    return None
-        except Exception as e:
-            logger.exception(f"🛑 Get inbound error: {e}")
-            return None
+    # ----------------------------------------------------------------------
+    # Низкоуровневые методы API v3.2.0 (/clients/*)
+    # ----------------------------------------------------------------------
 
-    async def update_inbound(self, inbound_id: int, data: dict):
-        """Обновление инбаунда"""
+    async def add_client(self, client: dict, inbound_ids: list) -> bool:
+        """Создание клиента и привязка к инбаундам: POST /clients/add.
+
+        Body: {"client": {...}, "inboundIds": [...]}.
+        """
         try:
-            url = self._build_url(f"/inbounds/update/{inbound_id}")
-            
-            logger.info(f"ℹ️  Updating inbound at: {url}")
-            
-            async with self.session.post(url, json=data) as resp:
+            url = self._build_url("/clients/add")
+            payload = {"client": client, "inboundIds": inbound_ids}
+            logger.info(f"ℹ️  Adding client {client.get('email')} → inbounds {inbound_ids}")
+            async with self.session.post(url, json=payload) as resp:
                 if resp.status != 200:
                     text = await resp.text()
-                    logger.error(f"🛑 Update inbound failed with status: {resp.status}, response: {text[:200]}...")
+                    logger.error(f"🛑 Add client failed: status={resp.status}, response={text[:200]}")
                     return False
-                
-                try:
-                    response = await resp.json()
-                    success = response.get("success", False)
-                    if success:
-                        logger.info(f"✅ Inbound {inbound_id} updated successfully")
-                    else:
-                        logger.error(f"🛑 Update inbound failed: {response.get('msg', 'Unknown error')}")
-                    return success
-                except Exception as e:
+                data = await resp.json()
+                success = data.get("success", False)
+                if success:
+                    logger.info(f"✅ Client {client.get('email')} added")
+                else:
+                    logger.error(f"🛑 Add client failed: {data.get('msg', 'Unknown error')}")
+                return success
+        except Exception as e:
+            logger.exception(f"🛑 Add client error: {e}")
+            return False
+
+    async def get_client(self, email: str):
+        """Получение клиента по email: GET /clients/get/{email}.
+
+        Возвращает объект клиента (плоские поля) с дополнительным ключом
+        ``inboundIds`` — списком привязанных инбаундов. None, если не найден.
+        """
+        try:
+            url = self._build_url(f"/clients/get/{quote(email, safe='')}")
+            async with self.session.get(url) as resp:
+                if resp.status != 200:
                     text = await resp.text()
-                    logger.debug(f"JSON parse failed: {e}, checking text response")
-                    return "success" in text.lower()
+                    logger.error(f"🛑 Get client failed: status={resp.status}, response={text[:200]}")
+                    return None
+                data = await resp.json()
+                if not data.get("success"):
+                    logger.error(f"🛑 Get client failed: {data.get('msg')}")
+                    return None
+                obj = data.get("obj") or {}
+                client = obj.get("client") if isinstance(obj, dict) else None
+                if not isinstance(client, dict):
+                    logger.warning(f"⚠️ Client {email} not found")
+                    return None
+                client = dict(client)
+                client["inboundIds"] = obj.get("inboundIds", [])
+                return client
         except Exception as e:
-            logger.exception(f"🛑 Update inbound error: {e}")
+            logger.exception(f"🛑 Get client error: {e}")
+            return None
+
+    async def update_client(self, email: str, client: dict) -> bool:
+        """Обновление клиента: POST /clients/update/{email}.
+
+        Тело — плоский объект клиента (без обёртки). Сервер заменяет строку
+        целиком, поэтому передавать полный набор полей.
+        """
+        try:
+            url = self._build_url(f"/clients/update/{quote(email, safe='')}")
+            async with self.session.post(url, json=client) as resp:
+                if resp.status != 200:
+                    text = await resp.text()
+                    logger.error(f"🛑 Update client failed: status={resp.status}, response={text[:200]}")
+                    return False
+                data = await resp.json()
+                success = data.get("success", False)
+                if not success:
+                    logger.error(f"🛑 Update client failed: {data.get('msg', 'Unknown error')}")
+                return success
+        except Exception as e:
+            logger.exception(f"🛑 Update client error: {e}")
             return False
 
-    async def create_vless_profile(self, telegram_id: int):
-        """Создание нового клиента для пользователя"""
-        if not await self.login():
-            logger.error("🛑 Login failed before creating profile")
-            return None
-        
-        inbound = await self.get_inbound(config.INBOUND_ID)
-        if not inbound:
-            logger.error(f"🛑 Inbound {config.INBOUND_ID} not found")
-            return None
-
-        reality_params = _extract_reality_from_inbound(inbound)
-        sid = reality_params.get("short_id") or config.REALITY_SHORT_ID
-        pbk = reality_params.get("public_key") or config.REALITY_PUBLIC_KEY
-        sni = reality_params.get("server_name") or config.REALITY_SNI
-        
+    async def delete_client(self, email: str, keep_traffic: bool = False) -> bool:
+        """Удаление клиента: POST /clients/del/{email}?keepTraffic=0|1."""
         try:
-            raw_settings = inbound["settings"]
-            if isinstance(raw_settings, str):
-                settings = json.loads(raw_settings)
-            elif isinstance(raw_settings, dict):
-                settings = raw_settings.copy()
-            else:
-                raise TypeError(f"Ожидали 'settings' как str или dict, а得到了 {type(raw_settings).__name__}")
-            clients = settings.get("clients", [])
-            
-            client_id = str(uuid.uuid4())
-            email = f"user_{telegram_id}_{random.randint(1000,9999)}"
-            
-            # Генерируем уникальный subscription ID
-            sub_id = secrets.token_urlsafe(16)
-            
-            # Обновленные настройки для Reality
-            new_client = {
-                "id": client_id,
-                "flow": (config.REALITY_FLOW or ""),
-                "email": email,
-                "limitIp": 0,
-                "totalGB": 0,
-                "expiryTime": 0,
-                "enable": True,
-                "tgId": "",
-                "subId": sub_id,  # Уникальный subscription ID
-                "reset": 0
-                # Параметры Reality (fingerprint, publicKey, shortId, spiderX) находятся в streamSettings инбаунда
-            }
-            
-            clients.append(new_client)
-            settings["clients"] = clients
-            
-            update_data = {
-                "up": inbound["up"],
-                "down": inbound["down"],
-                "total": inbound["total"],
-                "remark": inbound["remark"],
-                "enable": inbound["enable"],
-                "expiryTime": inbound["expiryTime"],
-                "listen": inbound["listen"],
-                "port": inbound["port"],
-                "protocol": inbound["protocol"],
-                "settings": json.dumps(settings, indent=2),
-                "streamSettings": inbound["streamSettings"],
-                "sniffing": inbound["sniffing"],
-                # "allocate": inbound["allocate"]
-            }
-            
-            if await self.update_inbound(config.INBOUND_ID, update_data):
-                logger.info(f"✅ Created VLESS profile for user {telegram_id}, email: {email}")
-                return {
-                    "client_id": client_id,
-                    "email": email,
-                    "sub_id": sub_id,  # Возвращаем subscription ID
-                    "port": inbound["port"],
-                    "flow": (config.REALITY_FLOW or ""),
-                    "encryption": config.VLESS_ENCRYPTION,
-                    # Указываем тип безопасности как reality
-                    "security": "reality",
-                    "remark": inbound["remark"],
-                    # Добавляем необходимые параметры для Reality
-                    "sni": sni,
-                    "pbk": pbk,
-                    "fp": config.REALITY_FINGERPRINT,
-                    "sid": sid,
-                    "spx": config.REALITY_SPIDER_X
-                }
-            logger.warning(f"⚠️ Failed to update inbound when creating profile for user {telegram_id}")
-            return None
-        except Exception as e:
-            logger.exception(f"🛑 Create profile error: {e}")
-            return None
-
-    async def create_static_client(self, profile_name: str):
-        """Создание статического клиента"""
-        if not await self.login():
-            logger.error("🛑 Login failed before creating static client")
-            return None
-        
-        inbound = await self.get_inbound(config.INBOUND_ID)
-        if not inbound:
-            logger.error(f"🛑 Inbound {config.INBOUND_ID} not found")
-            return None
-
-        reality_params = _extract_reality_from_inbound(inbound)
-        sid = reality_params.get("short_id") or config.REALITY_SHORT_ID
-        pbk = reality_params.get("public_key") or config.REALITY_PUBLIC_KEY
-        sni = reality_params.get("server_name") or config.REALITY_SNI
-        
-        try:
-            settings = json.loads(inbound["settings"])
-            clients = settings.get("clients", [])
-            
-            client_id = str(uuid.uuid4())
-            
-            # Генерируем уникальный subscription ID
-            sub_id = secrets.token_urlsafe(16)
-            
-            # Обновленные настройки для Reality
-            new_client = {
-                "id": client_id,
-                "flow": (config.REALITY_FLOW or ""),
-                "email": profile_name,
-                "limitIp": 0,
-                "totalGB": 0,
-                "expiryTime": 0,
-                "enable": True,
-                "tgId": "",
-                "subId": sub_id,  # Уникальный subscription ID
-                "reset": 0
-                # Параметры Reality (fingerprint, publicKey, shortId, spiderX) находятся в streamSettings инбаунда
-            }
-            
-            clients.append(new_client)
-            settings["clients"] = clients
-            
-            update_data = {
-                "up": inbound["up"],
-                "down": inbound["down"],
-                "total": inbound["total"],
-                "remark": inbound["remark"],
-                "enable": inbound["enable"],
-                "expiryTime": inbound["expiryTime"],
-                "listen": inbound["listen"],
-                "port": inbound["port"],
-                "protocol": inbound["protocol"],
-                "settings": json.dumps(settings, indent=2),
-                "streamSettings": inbound["streamSettings"],
-                "sniffing": inbound["sniffing"],
-                # "allocate": inbound["allocate"]
-            }
-            
-            if await self.update_inbound(config.INBOUND_ID, update_data):
-                logger.info(f"✅ Created static client: {profile_name}")
-                return {
-                    "client_id": client_id,
-                    "email": profile_name,
-                    "sub_id": sub_id,  # Возвращаем subscription ID
-                    "port": inbound["port"],
-                    "flow": (config.REALITY_FLOW or ""),
-                    "encryption": config.VLESS_ENCRYPTION,
-                    # Указываем тип безопасности как reality
-                    "security": "reality",
-                    "remark": inbound["remark"],
-                    # Добавляем необходимые параметры для Reality
-                    "sni": sni,
-                    "pbk": pbk,
-                    "fp": config.REALITY_FINGERPRINT,
-                    "sid": sid,
-                    "spx": config.REALITY_SPIDER_X
-                }
-            logger.warning(f"⚠️ Failed to update inbound when creating static client: {profile_name}")
-            return None
-        except Exception as e:
-            logger.exception(f"🛑 Create static client error: {e}")
-            return None
-
-    async def delete_client(self, email: str):
-        """Удаление клиента по email"""
-        if not await self.login():
-            return False
-        
-        try:
-            # Получаем данные инбаунда
-            inbound = await self.get_inbound(config.INBOUND_ID)
-            if not inbound:
-                return False
-            
-            settings = json.loads(inbound["settings"])
-            clients = settings.get("clients", [])
-            
-            # Фильтруем клиентов
-            new_clients = [c for c in clients if c["email"] != email]
-            
-            # Если не было изменений
-            if len(new_clients) == len(clients):
-                return False
-            
-            settings["clients"] = new_clients
-            
-            # Формируем данные для обновления
-            update_data = {
-                "up": inbound["up"],
-                "down": inbound["down"],
-                "total": inbound["total"],
-                "remark": inbound["remark"],
-                "enable": inbound["enable"],
-                "expiryTime": inbound["expiryTime"],
-                "listen": inbound["listen"],
-                "port": inbound["port"],
-                "protocol": inbound["protocol"],
-                "settings": json.dumps(settings, indent=2),
-                "streamSettings": inbound["streamSettings"],
-                "sniffing": inbound["sniffing"],
-                # "allocate": inbound["allocate"]
-            }
-            
-            return await self.update_inbound(config.INBOUND_ID, update_data)
+            keep = 1 if keep_traffic else 0
+            url = self._build_url(f"/clients/del/{quote(email, safe='')}") + f"?keepTraffic={keep}"
+            logger.info(f"ℹ️  Deleting client {email}")
+            async with self.session.post(url, json={}) as resp:
+                if resp.status != 200:
+                    text = await resp.text()
+                    logger.error(f"🛑 Delete client failed: status={resp.status}, response={text[:200]}")
+                    return False
+                data = await resp.json()
+                success = data.get("success", False)
+                if success:
+                    logger.info(f"✅ Client {email} deleted")
+                else:
+                    logger.error(f"🛑 Delete client failed: {data.get('msg', 'Unknown error')}")
+                return success
         except Exception as e:
             logger.exception(f"🛑 Delete client error: {e}")
             return False
 
-    async def toggle_client(self, email: str, enable: bool):
-        """Включение/отключение клиента по email (без удаления)"""
-        if not await self.login():
-            return False
-        
+    async def get_client_links(self, email: str) -> list:
+        """Готовые ссылки клиента по всем привязанным инбаундам: GET /clients/links/{email}."""
         try:
-            inbound = await self.get_inbound(config.INBOUND_ID)
-            if not inbound:
+            url = self._build_url(f"/clients/links/{quote(email, safe='')}")
+            async with self.session.get(url) as resp:
+                if resp.status != 200:
+                    text = await resp.text()
+                    logger.error(f"🛑 Get client links failed: status={resp.status}, response={text[:200]}")
+                    return []
+                data = await resp.json()
+                if data.get("success"):
+                    links = data.get("obj") or []
+                    return [l for l in links if isinstance(l, str) and l.strip()]
+                logger.error(f"🛑 Get client links failed: {data.get('msg')}")
+                return []
+        except Exception as e:
+            logger.exception(f"🛑 Get client links error: {e}")
+            return []
+
+    async def get_client_traffic(self, email: str) -> dict:
+        """Трафик клиента: GET /clients/traffic/{email}. Возвращает {upload, download}."""
+        try:
+            url = self._build_url(f"/clients/traffic/{quote(email, safe='')}")
+            async with self.session.get(url) as resp:
+                if resp.status != 200:
+                    return {"upload": 0, "download": 0}
+                data = await resp.json()
+                if data.get("success"):
+                    obj = data.get("obj")
+                    if isinstance(obj, dict):
+                        return {
+                            "upload": obj.get("up", 0) or 0,
+                            "download": obj.get("down", 0) or 0,
+                        }
+        except Exception as e:
+            logger.error(f"🛑 Client traffic error: {e}")
+        return {"upload": 0, "download": 0}
+
+    async def toggle_client(self, email: str, enable: bool) -> bool:
+        """Включение/отключение клиента (без удаления).
+
+        Читаем текущего клиента, выставляем enable, отправляем полный набор
+        полей обратно (сервер заменяет строку целиком).
+        """
+        try:
+            client = await self.get_client(email)
+            if not client:
+                logger.warning(f"⚠️ Client {email} not found, cannot toggle")
                 return False
-            
-            raw_settings = inbound["settings"]
-            if isinstance(raw_settings, str):
-                settings = json.loads(raw_settings)
-            elif isinstance(raw_settings, dict):
-                settings = raw_settings.copy()  # копируем, чтобы не менять оригинал
-            else:
-                raise TypeError(f"Ожидали 'settings' как str или dict, а得到了 {type(raw_settings).__name__}")
-            clients = settings.get("clients", [])
-            
-            found = False
-            for client in clients:
-                if client["email"] == email:
-                    client["enable"] = enable
-                    found = True
-                    break
-            
-            if not found:
-                logger.warning(f"⚠️ Client {email} not found in inbound")
-                return False
-            
-            settings["clients"] = clients
-            
-            update_data = {
-                "up": inbound["up"],
-                "down": inbound["down"],
-                "total": inbound["total"],
-                "remark": inbound["remark"],
-                "enable": inbound["enable"],
-                "expiryTime": inbound["expiryTime"],
-                "listen": inbound["listen"],
-                "port": inbound["port"],
-                "protocol": inbound["protocol"],
-                "settings": json.dumps(settings, indent=2),
-                "streamSettings": inbound["streamSettings"],
-                "sniffing": inbound["sniffing"],
-            }
-            
-            result = await self.update_inbound(config.INBOUND_ID, update_data)
+
+            # Убираем read-only / служебные поля, которые не входят в payload
+            for ro in ("id", "createdAt", "updatedAt", "traffic", "inboundIds", "group"):
+                client.pop(ro, None)
+
+            client["enable"] = enable
+
+            result = await self.update_client(email, client)
             if result:
-                action = "enabled" if enable else "disabled"
-                logger.info(f"✅ Client {email} {action}")
+                logger.info(f"✅ Client {email} {'enabled' if enable else 'disabled'}")
             return result
         except Exception as e:
             logger.exception(f"🛑 Toggle client error: {e}")
             return False
-    
-    async def get_user_stats(self, email: str):
-        """Получение статистики по email"""
-        if not await self.login():
-            logger.error("🛑 Login failed before getting stats")
-            return {"upload": 0, "download": 0}
-        
-        try:
-            url = self._build_url(f"/inbounds/getClientTraffics/{email}")
-            
-            async with self.session.get(url) as resp:
-                if resp.status != 200:
-                    return {"upload": 0, "download": 0}
-                
-                try:
-                    data = await resp.json()
-                    if data.get("success"):
-                        client_data = data.get("obj")
-                        if isinstance(client_data, dict):
-                            return {
-                                "upload": client_data.get("up", 0),
-                                "download": client_data.get("down", 0)
-                            }
-                except Exception as e:
-                    logger.debug(f"Failed to parse user stats JSON: {e}")
-                    return {"upload": 0, "download": 0}
-        except Exception as e:
-            logger.error(f"🛑 Stats error: {e}")
-        return {"upload": 0, "download": 0}
-    
-    async def get_global_stats(self, inbound_id: int):
-        """Получение статистики по email"""
-        if not await self.login():
-            logger.error("🛑 Login failed before getting stats")
-            return {"upload": 0, "download": 0}
-        
+
+    # ----------------------------------------------------------------------
+    # Инбаунды / статистика
+    # ----------------------------------------------------------------------
+
+    async def get_inbound(self, inbound_id: int):
+        """Получение данных одного инбаунда: GET /inbounds/get/{id} (fallback)."""
         try:
             url = self._build_url(f"/inbounds/get/{inbound_id}")
-            
+            async with self.session.get(url) as resp:
+                if resp.status != 200:
+                    text = await resp.text()
+                    logger.error(f"🛑 Get inbound failed: status={resp.status}, response={text[:100]}")
+                    return None
+                data = await resp.json()
+                if data.get("success"):
+                    return data.get("obj")
+                logger.error(f"🛑 Get inbound failed: {data.get('msg')}")
+                return None
+        except Exception as e:
+            logger.exception(f"🛑 Get inbound error: {e}")
+            return None
+
+    async def get_all_inbound_ids(self, protocols=("vless", "vmess", "trojan", "shadowsocks")) -> list:
+        """Актуальный список id инбаундов с панели: GET /inbounds/list.
+
+        Используется для динамической привязки нового клиента ко всем инбаундам
+        (чтобы при добавлении нового сервера/инбаунда ничего не править в конфиге).
+        Фильтруем по клиентским протоколам, чтобы не привязывать клиента к
+        служебным инбаундам (dokodemo-door, wireguard, http, socks и т.п.),
+        у которых нет понятия «клиент».
+        """
+        try:
+            url = self._build_url("/inbounds/list")
+            async with self.session.get(url) as resp:
+                if resp.status != 200:
+                    text = await resp.text()
+                    logger.error(f"🛑 Get inbounds list failed: status={resp.status}, response={text[:200]}")
+                    return []
+                data = await resp.json()
+                if not data.get("success"):
+                    logger.error(f"🛑 Get inbounds list failed: {data.get('msg')}")
+                    return []
+                ids = []
+                for ib in data.get("obj") or []:
+                    if isinstance(ib, dict) and ib.get("id") is not None:
+                        if protocols is None or ib.get("protocol") in protocols:
+                            ids.append(ib["id"])
+                return sorted(ids)
+        except Exception as e:
+            logger.exception(f"🛑 Get inbounds list error: {e}")
+            return []
+
+    async def get_global_stats(self) -> dict:
+        """Суммарный трафик по всем инбаундам: GET /inbounds/list."""
+        try:
+            url = self._build_url("/inbounds/list")
             async with self.session.get(url) as resp:
                 if resp.status != 200:
                     return {"upload": 0, "download": 0}
-                
-                try:
-                    data = await resp.json()
-                    if data.get("success"):
-                        client_data = data.get("obj")
-                        if isinstance(client_data, dict):
-                            return {
-                                "upload": client_data.get("up", 0),
-                                "download": client_data.get("down", 0)
-                            }
-                except Exception as e:
-                    logger.debug(f"Failed to parse global stats JSON: {e}")
+                data = await resp.json()
+                if not data.get("success"):
                     return {"upload": 0, "download": 0}
+                up = down = 0
+                for ib in data.get("obj") or []:
+                    if isinstance(ib, dict):
+                        up += ib.get("up", 0) or 0
+                        down += ib.get("down", 0) or 0
+                return {"upload": up, "download": down}
         except Exception as e:
-            logger.error(f"🛑 Stats error: {e}")
+            logger.error(f"🛑 Global stats error: {e}")
         return {"upload": 0, "download": 0}
 
-    async def get_online_users(self):
-        if not await self.login():
-            logger.error("🛑 Login failed before getting stats")
-            return 0
-        
+    async def get_online_users(self) -> int:
+        """Количество онлайн-пользователей бота: POST /clients/onlines."""
         try:
-            url = self._build_url("/inbounds/onlines")
-            
+            url = self._build_url("/clients/onlines")
             async with self.session.post(url) as resp:
                 if resp.status != 200:
                     return 0
-
-                
-                try:
-                    data = await resp.json()
-                    logger.debug(data)
-                    online = 0
-                    if data.get("success"):
-                        users = data.get("obj")
-                        if isinstance(users, list):
-                            for user in users:
-                                if str(user).startswith("user_"):
-                                    online += 1
-                        return online
-                except Exception as e:
-                    logger.debug(f"Failed to parse online users JSON: {e}")
-                    return 0
+                data = await resp.json()
+                if data.get("success"):
+                    users = data.get("obj")
+                    if isinstance(users, list):
+                        return sum(1 for u in users if str(u).startswith("user_"))
         except Exception as e:
-            logger.error(f"🛑 Stats error: {e}")
+            logger.error(f"🛑 Online users error: {e}")
         return 0
+
+    # ----------------------------------------------------------------------
+    # Высокоуровневые операции
+    # ----------------------------------------------------------------------
+
+    async def _create_client(self, email: str, telegram_id: int = 0):
+        """Общая логика создания клиента и привязки ко всем INBOUND_IDS.
+
+        Возвращает profile_data в формате, совместимом со старыми записями БД.
+        """
+        client_id = str(uuid.uuid4())
+        sub_id = secrets.token_urlsafe(16)
+
+        client = {
+            "email": email,
+            "id": client_id,        # uuid клиента (VLESS)
+            "uuid": client_id,      # дублируем — панель принимает оба варианта
+            "subId": sub_id,
+            "flow": (config.REALITY_FLOW or ""),
+            "limitIp": 0,
+            "totalGB": 0,
+            "expiryTime": 0,
+            "enable": True,
+            "tgId": telegram_id or 0,
+            "reset": 0,
+        }
+
+        # Определяем инбаунды для привязки:
+        #  1) если INBOUND_IDS задан в конфиге — используем его (явное закрепление);
+        #  2) иначе запрашиваем актуальный список с панели (авто-режим);
+        #  3) если и это не удалось — fallback на единственный INBOUND_ID.
+        inbound_ids = list(config.INBOUND_IDS or [])
+        if not inbound_ids:
+            inbound_ids = await self.get_all_inbound_ids()
+            logger.info(f"ℹ️  Auto inbound list from panel: {inbound_ids}")
+        if not inbound_ids:
+            inbound_ids = [config.INBOUND_ID]
+
+        if not await self.add_client(client, inbound_ids):
+            return None
+
+        # profile_data с прежними ключами (для обратной совместимости БД/хендлеров).
+        # Reality-поля заполняем из конфига — они нужны только generate_vless_url
+        # (fallback); основной путь использует ссылки от панели.
+        return {
+            "client_id": client_id,
+            "email": email,
+            "sub_id": sub_id,
+            "port": int(config.VLESS_PUBLIC_PORT) if getattr(config, "VLESS_PUBLIC_PORT", 0) else 443,
+            "flow": (config.REALITY_FLOW or ""),
+            "encryption": config.VLESS_ENCRYPTION,
+            "security": "reality",
+            "remark": "",
+            "sni": config.REALITY_SNI,
+            "pbk": config.REALITY_PUBLIC_KEY,
+            "fp": config.REALITY_FINGERPRINT,
+            "sid": config.REALITY_SHORT_ID,
+            "spx": config.REALITY_SPIDER_X,
+        }
+
+    async def create_vless_profile(self, telegram_id: int):
+        """Создание профиля для пользователя бота."""
+        if not await self.login():
+            logger.error("🛑 Login failed before creating profile")
+            return None
+        email = f"user_{telegram_id}_{random.randint(1000, 9999)}"
+        profile = await self._create_client(email, telegram_id=telegram_id)
+        if profile:
+            logger.info(f"✅ Created VLESS profile for user {telegram_id}, email: {email}")
+        else:
+            logger.warning(f"⚠️ Failed to create profile for user {telegram_id}")
+        return profile
+
+    async def create_static_client(self, profile_name: str):
+        """Создание статического клиента (имя = email)."""
+        if not await self.login():
+            logger.error("🛑 Login failed before creating static client")
+            return None
+        profile = await self._create_client(profile_name, telegram_id=0)
+        if profile:
+            logger.info(f"✅ Created static client: {profile_name}")
+        else:
+            logger.warning(f"⚠️ Failed to create static client: {profile_name}")
+        return profile
+
+    async def get_user_stats(self, email: str):
+        """Статистика по email (совместимость со старым API хендлеров)."""
+        if not await self.login():
+            logger.error("🛑 Login failed before getting stats")
+            return {"upload": 0, "download": 0}
+        return await self.get_client_traffic(email)
 
     async def close(self):
         if self.session:
             await self.session.close()
+
+
+# --------------------------------------------------------------------------
+# Публичные функции-обёртки (контракт для handlers.py / app.py / subscription_server.py)
+# --------------------------------------------------------------------------
 
 async def create_vless_profile(telegram_id: int):
     api = XUIAPI()
@@ -597,6 +513,7 @@ async def create_vless_profile(telegram_id: int):
     finally:
         await api.close()
 
+
 async def create_static_client(profile_name: str):
     api = XUIAPI()
     try:
@@ -604,40 +521,56 @@ async def create_static_client(profile_name: str):
     finally:
         await api.close()
 
+
 async def delete_client_by_email(email: str):
     api = XUIAPI()
     try:
+        if not await api.login():
+            return False
         return await api.delete_client(email)
     finally:
         await api.close()
 
+
 async def enable_client_by_email(email: str):
     api = XUIAPI()
     try:
+        if not await api.login():
+            return False
         return await api.toggle_client(email, enable=True)
     finally:
         await api.close()
 
+
 async def disable_client_by_email(email: str):
     api = XUIAPI()
     try:
+        if not await api.login():
+            return False
         return await api.toggle_client(email, enable=False)
     finally:
         await api.close()
 
+
 async def get_global_stats():
     api = XUIAPI()
     try:
-        return await api.get_global_stats(config.INBOUND_ID)
+        if not await api.login():
+            return {"upload": 0, "download": 0}
+        return await api.get_global_stats()
     finally:
         await api.close()
+
 
 async def get_online_users():
     api = XUIAPI()
     try:
+        if not await api.login():
+            return 0
         return await api.get_online_users()
     finally:
         await api.close()
+
 
 async def get_user_stats(email: str):
     api = XUIAPI()
@@ -646,7 +579,24 @@ async def get_user_stats(email: str):
     finally:
         await api.close()
 
+
+async def get_client_links_by_email(email: str) -> list:
+    """Готовые ссылки клиента (все инбаунды/протоколы) от панели v3.2.0."""
+    api = XUIAPI()
+    try:
+        if not await api.login():
+            return []
+        return await api.get_client_links(email)
+    finally:
+        await api.close()
+
+
 def generate_vless_url(profile_data: dict) -> str:
+    """Ручная сборка VLESS-URL (Reality) — fallback.
+
+    Основной путь в v3.2.0 — ссылки от панели (get_client_links_by_email).
+    Оставлено для совместимости/аварийного случая, когда панель недоступна.
+    """
     remark = profile_data.get('remark', '')
     email = profile_data['email']
     fragment = f"{remark}-{email}" if remark else email
@@ -662,7 +612,7 @@ def generate_vless_url(profile_data: dict) -> str:
 
     host = (config.VLESS_PUBLIC_HOST or "").strip() or config.XUI_HOST
     port = int(config.VLESS_PUBLIC_PORT) if getattr(config, "VLESS_PUBLIC_PORT", 0) else int(profile_data["port"])
-    
+
     return (
         f"vless://{profile_data['client_id']}@{host}:{port}"
         f"?type=tcp&encryption={encryption}&security=reality"
