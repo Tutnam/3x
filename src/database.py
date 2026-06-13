@@ -15,7 +15,6 @@ class User(Base):
     username = Column(String)
     registration_date = Column(DateTime, default=datetime.utcnow)
     subscription_end = Column(DateTime)
-    vless_profile_id = Column(String)
     vless_profile_data = Column(String)
     subscription_id = Column(String, unique=True)  # Уникальный ID для subscription URL
     is_admin = Column(Boolean, default=False)
