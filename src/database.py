@@ -67,26 +67,6 @@ async def delete_user_profile(telegram_id: int):
             session.commit()
             logger.info(f"✅ User profile deleted: {telegram_id}")
 
-async def update_subscription(telegram_id: int, months: int):
-    """Обновляет подписку с учетом текущего состояния"""
-    with Session() as session:
-        user = session.query(User).filter_by(telegram_id=telegram_id).first()
-        if user:
-            now = datetime.utcnow()
-            # Если подписка активна, добавляем к текущей дате окончания
-            if user.subscription_end and user.subscription_end > now:
-                user.subscription_end += timedelta(days=months * 30)
-            else:
-                # Если подписка истекла, начинаем с текущей даты
-                user.subscription_end = now + timedelta(days=months * 30)
-            
-            # Сбрасываем флаг уведомления
-            user.notified = False
-            session.commit()
-            logger.info(f"✅ Subscription updated for {telegram_id}: +{months} months")
-            return True
-        return False
-
 async def get_all_users(with_subscription: bool = None):
     with Session() as session:
         query = session.query(User)

@@ -5,6 +5,7 @@ import json
 import logging
 import random
 import secrets
+from datetime import datetime, timezone
 from config import config
 from urllib.parse import quote
 
@@ -344,6 +345,45 @@ class XUIAPI:
             logger.exception(f"🛑 Set client subscription error: {e}")
             return False
 
+    async def add_time(self, email: str, seconds: int):
+        """Добавить (или списать при отрицательном seconds) время клиенту.
+
+        Читает текущий expiryTime, считает новый АБСОЛЮТНЫЙ срок и пишет его.
+        База = max(текущий, сейчас); безлимит (0) трактуется как «сейчас», т.е.
+        добавление времени делает срок конечным от текущего момента.
+        Возвращает новый expiry_ms или None при ошибке.
+        """
+        client = await self.get_client(email)
+        if not client:
+            logger.warning(f"⚠️ Client {email} not found, cannot add time")
+            return None
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        current = int(client.get("expiryTime") or 0)
+        base = current if current > now_ms else now_ms
+        new_ms = base + int(seconds) * 1000
+        if new_ms < now_ms:
+            new_ms = now_ms  # при списании не уходим в прошлое — истекает «сейчас»
+        ok = await self.set_client_subscription(email, new_ms, enable=True)
+        return new_ms if ok else None
+
+    async def get_clients_list(self) -> list:
+        """Все клиенты панели: GET /clients/list (obj — список с tgId/expiryTime)."""
+        try:
+            url = self._build_url("/clients/list")
+            async with self.session.get(url) as resp:
+                if resp.status != 200:
+                    text = await resp.text()
+                    logger.error(f"🛑 Get clients list failed: status={resp.status}, response={text[:200]}")
+                    return []
+                data = await resp.json()
+                if data.get("success"):
+                    return data.get("obj") or []
+                logger.error(f"🛑 Get clients list failed: {data.get('msg')}")
+                return []
+        except Exception as e:
+            logger.exception(f"🛑 Get clients list error: {e}")
+            return []
+
     # ----------------------------------------------------------------------
     # Инбаунды / статистика
     # ----------------------------------------------------------------------
@@ -556,6 +596,30 @@ async def set_client_subscription_by_email(email: str, expiry_ms: int, enable: b
         if not await api.login():
             return False
         return await api.set_client_subscription(email, expiry_ms, enable=enable)
+    finally:
+        await api.close()
+
+
+async def add_time_by_email(email: str, seconds: int):
+    """Добавить/списать время клиенту в панели (read-modify-write expiryTime).
+
+    Возвращает новый expiry_ms или None при ошибке."""
+    api = XUIAPI()
+    try:
+        if not await api.login():
+            return None
+        return await api.add_time(email, seconds)
+    finally:
+        await api.close()
+
+
+async def get_clients_list():
+    """Список всех клиентов панели (для зеркалирования срока в БД бота)."""
+    api = XUIAPI()
+    try:
+        if not await api.login():
+            return []
+        return await api.get_clients_list()
     finally:
         await api.close()
 
