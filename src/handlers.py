@@ -11,11 +11,11 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from config import config
 from database import (
-    StaticProfile, get_user, create_user, update_subscription, 
-    get_all_users, create_static_profile, get_static_profiles, 
+    StaticProfile, get_user, create_user,
+    get_all_users, create_static_profile, get_static_profiles,
     User, Session, get_user_stats as db_user_stats
 )
-from functions import create_vless_profile, delete_client_by_email, enable_client_by_email, generate_vless_url, get_user_stats, create_static_client, get_global_stats, get_online_users, get_client_links_by_email, set_client_subscription_by_email
+from functions import create_vless_profile, delete_client_by_email, generate_vless_url, get_user_stats, create_static_client, get_global_stats, get_online_users, get_client_links_by_email, add_time_by_email
 
 logger = logging.getLogger(__name__)
 
@@ -53,36 +53,50 @@ def _to_epoch_ms(dt) -> int:
         return 0
     return int(dt.replace(tzinfo=timezone.utc).timestamp() * 1000)
 
-async def sync_subscription_to_panel(telegram_id: int):
-    """Привести срок (expiryTime) и состояние (enable) клиента в панели в
-    соответствие с подпиской пользователя в БД бота.
+def _ms_to_dt(ms):
+    """Unix epoch в мс → naive-UTC datetime. 0/пусто → дальняя дата (безлимит)."""
+    try:
+        ms = int(ms)
+    except (TypeError, ValueError):
+        ms = 0
+    if ms <= 0:
+        return datetime(2099, 1, 1)
+    return datetime.utcfromtimestamp(ms / 1000)
 
-    Вызывается после любого изменения subscription_end (создание профиля,
-    оплата, продление/изменение времени админом)."""
+async def grant_time(telegram_id: int, seconds: int) -> bool:
+    """Изменить срок подписки на seconds (может быть отрицательным).
+
+    Источник правды по времени — панель. Если у пользователя есть клиент в
+    панели — меняем срок там (read-modify-write expiryTime) и зеркалим в БД.
+    Если профиля ещё нет — правим только БД (срок перенесётся в панель при
+    создании клиента на «Подключить»)."""
     user = await get_user(telegram_id)
-    if not user or not user.vless_profile_data:
-        return
+    if not user:
+        return False
     profile = safe_json_loads(user.vless_profile_data, default={})
     email = profile.get("email")
-    if not email:
-        return
     now = datetime.utcnow()
-    active = bool(user.subscription_end and user.subscription_end > now)
-    expiry_ms = _to_epoch_ms(user.subscription_end)
-    ok = await set_client_subscription_by_email(email, expiry_ms, enable=active)
-    if not ok:
-        logger.warning(f"⚠️ Не удалось синхронизировать срок в панели для {telegram_id} ({email})")
-        return
-    # Держим флаг disabled в профиле в согласии с состоянием
-    if active:
-        profile.pop("disabled", None)
+
+    if email:
+        new_ms = await add_time_by_email(email, seconds)
+        if not new_ms:
+            logger.warning(f"⚠️ Не удалось изменить срок в панели для {telegram_id} ({email})")
+            return False
+        new_end = _ms_to_dt(new_ms)
     else:
-        profile["disabled"] = True
+        base = user.subscription_end if (user.subscription_end and user.subscription_end > now) else now
+        new_end = base + timedelta(seconds=seconds)
+        if new_end < now:
+            new_end = now
+
     with Session() as session:
         db_user = session.query(User).filter_by(telegram_id=telegram_id).first()
-        if db_user:
-            db_user.vless_profile_data = json.dumps(profile)
-            session.commit()
+        if not db_user:
+            return False
+        db_user.subscription_end = new_end
+        db_user.notified = False
+        session.commit()
+    return True
 
 async def update_user_info(user, message) -> bool:
     """Обновляет данные пользователя если они изменились. Возвращает True если были изменения."""
@@ -298,17 +312,11 @@ async def process_successful_payment(message: Message, bot: Bot):
             now = datetime.utcnow()
             action_type = "продлена" if user.subscription_end and user.subscription_end > now else "куплена"
             
-            # Обновляем подписку
-            success = await update_subscription(message.from_user.id, months)
+            # Обновляем подписку (источник правды — панель; для без-профильных
+            # юзеров срок ложится в БД и применится при «Подключить»)
+            success = await grant_time(message.from_user.id, months * 30 * 24 * 60 * 60)
             suffix = "месяц" if months == 1 else "месяца" if months in (2,3,4) else "месяцев"
             if success:
-                # Синхронизируем срок в панели и включаем профиль (если он есть)
-                if user.vless_profile_data:
-                    try:
-                        await sync_subscription_to_panel(message.from_user.id)
-                    except Exception as e:
-                        logger.error(f"🛑 Failed to sync subscription after payment: {e}")
-                
                 await message.answer(
                     f"✅ Оплата прошла успешно! Ваша подписка {action_type} на {months} {suffix}.\n\n"
                     "Спасибо за покупку! 🎉"
@@ -395,19 +403,12 @@ async def admin_add_time_amount(message: Message, state: FSMContext):
             hours * 60 * 60 +
             minutes * 60
         )
-        
-        with Session() as session:
-            user = session.query(User).filter_by(telegram_id=user_id).first()
-            if user:
-                if user.subscription_end and user.subscription_end > datetime.utcnow():
-                    user.subscription_end += timedelta(seconds=total_seconds)
-                else:
-                    user.subscription_end = datetime.utcnow() + timedelta(seconds=total_seconds)
-                session.commit()
-                await sync_subscription_to_panel(user_id)
-                await message.answer(f"✅ Добавлено время пользователю {user_id}")
-            else:
-                await message.answer("❌ Пользователь не найден")
+
+        # Источник правды — панель: grant_time меняет срок там и зеркалит в БД
+        if await grant_time(user_id, total_seconds):
+            await message.answer(f"✅ Добавлено время пользователю {user_id}")
+        else:
+            await message.answer("❌ Пользователь не найден")
     except Exception as e:
         await message.answer(f"Ошибка: {str(e)}")
     finally:
@@ -447,21 +448,12 @@ async def admin_remove_time_amount(message: Message, state: FSMContext):
             hours * 60 * 60 +
             minutes * 60
         )
-        
-        with Session() as session:
-            user = session.query(User).filter_by(telegram_id=user_id).first()
-            if user:
-                base_end = user.subscription_end or datetime.utcnow()
-                new_end = base_end - timedelta(seconds=total_seconds)
-                # Проверяем, чтобы не ушло в прошлое
-                if new_end < datetime.utcnow():
-                    new_end = datetime.utcnow()
-                user.subscription_end = new_end
-                session.commit()
-                await sync_subscription_to_panel(user_id)
-                await message.answer(f"✅ Удалено время у пользователя {user_id}")
-            else:
-                await message.answer("❌ Пользователь не найден")
+
+        # Списание времени = отрицательный grant_time (правит срок в панели + БД)
+        if await grant_time(user_id, -total_seconds):
+            await message.answer(f"✅ Удалено время у пользователя {user_id}")
+        else:
+            await message.answer("❌ Пользователь не найден")
     except Exception as e:
         await message.answer(f"Ошибка: {str(e)}")
     finally:
@@ -695,12 +687,9 @@ async def connect_profile(callback: CallbackQuery):
             await callback.message.answer("🛑 Ошибка при создании профиля. Попробуйте позже.")
             return
     else:
-        # Профиль уже есть — синхронизируем срок и включаем обратно
-        try:
-            await sync_subscription_to_panel(user.telegram_id)
-            user = await get_user(user.telegram_id)
-        except Exception as e:
-            logger.error(f"🛑 Failed to re-enable client on connect: {e}")
+        # Профиль уже есть — источник правды о сроке панель, ничего пушить не нужно.
+        # Подписка активна (проверено выше), просто показываем ссылки.
+        pass
     
     profile_data = safe_json_loads(user.vless_profile_data, default={})
     if not profile_data:

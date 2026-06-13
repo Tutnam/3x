@@ -7,7 +7,7 @@ from config import config
 from aiogram import Bot, Dispatcher
 from handlers import setup_handlers
 from datetime import datetime, timedelta
-from functions import delete_client_by_email, disable_client_by_email
+from functions import get_clients_list
 from database import Session, User, init_db, get_all_users, delete_user_profile
 from subscription_server import start_subscription_server
 
@@ -17,24 +17,72 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 coloredlogs.install(level='info')
 logger = logging.getLogger(__name__)
 
-async def check_subscriptions(bot: Bot):
-    """Проверка статуса подписок"""
+UNLIMITED_END = datetime(2099, 1, 1)  # зеркало безлимита (expiryTime == 0)
+
+
+def _ms_to_dt(ms):
+    """Unix epoch в мс → naive-UTC datetime. 0/пусто → дальняя дата (безлимит)."""
+    try:
+        ms = int(ms)
+    except (TypeError, ValueError):
+        ms = 0
+    if ms <= 0:
+        return UNLIMITED_END
+    return datetime.utcfromtimestamp(ms / 1000)
+
+
+async def sync_subscriptions(bot: Bot):
+    """Зеркалит срок подписки из панели (источник правды) в БД бота и шлёт
+    предупреждение за 24 часа до истечения.
+
+    Бот НЕ отключает клиентов — этим занимается сама панель по expiryTime.
+    Ручные правки срока в панели также подхватываются этим циклом."""
     while True:
         try:
+            # 1) Тянем актуальные сроки клиентов из панели
+            clients = await get_clients_list()
+            by_email = {c.get("email"): c for c in clients if c.get("email")}
+
             now = datetime.utcnow()
-            users = await get_all_users()
-            
-            for user in users:
-                if not user.subscription_end:
+
+            # 2) Зеркалим срок панели → subscription_end для юзеров с профилем
+            for user in await get_all_users():
+                if not user.vless_profile_data:
                     continue
-                # Проверка за 1 день до окончания
-                if user.subscription_end - now < timedelta(days=1) and user.subscription_end >= now and not user.notified:
+                try:
+                    profile = json.loads(user.vless_profile_data)
+                except Exception:
+                    continue
+                client = by_email.get(profile.get("email"))
+                if client is None:
+                    continue
+                new_end = _ms_to_dt(client.get("expiryTime"))
+                with Session() as session:
+                    db_user = session.query(User).filter_by(telegram_id=user.telegram_id).first()
+                    if not db_user:
+                        continue
+                    changed = False
+                    if db_user.subscription_end != new_end:
+                        db_user.subscription_end = new_end
+                        changed = True
+                    # Срок далеко (>1 дня) — снимаем флаг, чтобы снова предупредить
+                    if new_end - now > timedelta(days=1) and db_user.notified:
+                        db_user.notified = False
+                        changed = True
+                    if changed:
+                        session.commit()
+
+            # 3) Предупреждение за 24ч (для всех: профильных — по зеркалу,
+            #    триальных без профиля — по их subscription_end в БД)
+            for user in await get_all_users():
+                if not user.subscription_end or user.notified:
+                    continue
+                if timedelta(0) < user.subscription_end - now < timedelta(days=1):
                     try:
                         await bot.send_message(
                             user.telegram_id,
                             "⚠️ Ваша подписка истекает через 24 часа! Продлите подписку, чтобы сохранить доступ."
                         )
-                        # Помечаем как уведомленного
                         with Session() as session:
                             db_user = session.query(User).filter_by(telegram_id=user.telegram_id).first()
                             if db_user:
@@ -42,38 +90,9 @@ async def check_subscriptions(bot: Bot):
                                 session.commit()
                     except Exception as e:
                         logger.warning(f"⚠️ Notification error: {e}")
-                
-                # Проверка истечения подписки
-                if user.subscription_end <= now and user.vless_profile_data:
-                    try:
-                        profile = json.loads(user.vless_profile_data)
-                        # Пропускаем если уже отключали
-                        if profile.get("disabled"):
-                            continue
-                        
-                        # Отключаем клиента в инбаунде (не удаляем)
-                        success = await disable_client_by_email(profile["email"])
-                        if success:
-                            # Помечаем профиль как отключённый
-                            profile["disabled"] = True
-                            with Session() as session:
-                                db_user = session.query(User).filter_by(telegram_id=user.telegram_id).first()
-                                if db_user:
-                                    db_user.vless_profile_data = json.dumps(profile)
-                                    db_user.notified = True
-                                    session.commit()
-                            
-                            await bot.send_message(
-                                user.telegram_id,
-                                "❌ Ваша подписка истекла! VPN профиль отключён. Продлите подписку, чтобы восстановить доступ."
-                            )
-                        else:
-                            logger.warning(f"⚠️ Failed to disable client {profile['email']}")
-                    except Exception as e:
-                        logger.warning(f"⚠️ Disable error: {e}")
         except Exception as e:
-            logger.warning(f"⚠️ Subscription check error: {e}")
-        
+            logger.warning(f"⚠️ Subscription sync error: {e}")
+
         await asyncio.sleep(3600)
 
 async def update_admins_status():
@@ -123,7 +142,7 @@ async def main():
     
     # Запускаем фоновые задачи
     try:
-        asyncio.create_task(check_subscriptions(bot))
+        asyncio.create_task(sync_subscriptions(bot))
         asyncio.create_task(start_subscription_server())
         logger.info("✅ Background tasks started")
     except Exception as e:
