@@ -32,6 +32,7 @@ class AdminStates(StatesGroup):
     REMOVE_TIME_USER = State()
     ADD_TIME_AMOUNT = State()
     REMOVE_TIME_AMOUNT = State()
+    ADD_TIME_ALL_AMOUNT = State()
     SEND_MESSAGE_TARGET = State()
 
 
@@ -360,13 +361,100 @@ async def admin_menu(callback: CallbackQuery):
     builder = InlineKeyboardBuilder()
     builder.button(text="+ время", callback_data="admin_add_time")
     builder.button(text="- время", callback_data="admin_remove_time")
+    builder.button(text="➕ время всем активным", callback_data="admin_add_time_all")
     builder.button(text="📋 Список пользователей", callback_data="admin_user_list")
     builder.button(text="📊 Статистика исп. сети", callback_data="admin_network_stats")
     builder.button(text="📢 Рассылка", callback_data="admin_send_message")
     builder.button(text="⬅️ Назад", callback_data="back_to_menu")
-    builder.adjust(2, 1, 1, 1, 1)
+    builder.adjust(2, 1, 1, 1, 1, 1)
     
     await callback.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode='Markdown')
+
+# Добавление времени сразу всем активным пользователям
+@router.callback_query(F.data == "admin_add_time_all")
+async def admin_add_time_all_start(callback: CallbackQuery, state: FSMContext):
+    user = await get_user(callback.from_user.id)
+    if not user or not user.is_admin:
+        await callback.answer("🛑 Доступ запрещен!")
+        return
+    await callback.answer()
+    await callback.message.answer(
+        "Введите время для добавления ВСЕМ активным пользователям:\n"
+        "Месяцы Дни Часы Минуты\nПример: 1 0 0 0"
+    )
+    await state.set_state(AdminStates.ADD_TIME_ALL_AMOUNT)
+
+@router.message(AdminStates.ADD_TIME_ALL_AMOUNT)
+async def admin_add_time_all_amount(message: Message, state: FSMContext):
+    parts = message.text.split()
+    if len(parts) != 4:
+        await message.answer("Ошибка: нужно ввести 4 числа")
+        return
+    try:
+        months, days, hours, minutes = map(int, parts)
+    except ValueError:
+        await message.answer("Ошибка: нужно ввести 4 числа")
+        return
+
+    total_seconds = months * 30 * 24 * 60 * 60 + days * 24 * 60 * 60 + hours * 60 * 60 + minutes * 60
+    if total_seconds <= 0:
+        await message.answer("Ошибка: время должно быть больше нуля")
+        return
+    await state.clear()
+
+    active = await get_all_users(with_subscription=True)
+    if not active:
+        await message.answer("Нет пользователей с активной подпиской")
+        return
+
+    human = " ".join(p for p in (
+        f"{months} мес" if months else "",
+        f"{days} дн" if days else "",
+        f"{hours} ч" if hours else "",
+        f"{minutes} мин" if minutes else "",
+    ) if p) or "0"
+
+    builder = InlineKeyboardBuilder()
+    builder.button(text=f"✅ Да, добавить ({len(active)})", callback_data=f"do_add_all_{total_seconds}")
+    builder.button(text="❌ Отмена", callback_data="admin_menu")
+    builder.adjust(1)
+    await message.answer(
+        f"Добавить **{human}** всем активным пользователям (**{len(active)}**)?",
+        reply_markup=builder.as_markup(), parse_mode='Markdown'
+    )
+
+@router.callback_query(F.data.startswith("do_add_all_"))
+async def admin_add_time_all_apply(callback: CallbackQuery):
+    user = await get_user(callback.from_user.id)
+    if not user or not user.is_admin:
+        await callback.answer("🛑 Доступ запрещен!")
+        return
+    await callback.answer()
+    try:
+        total_seconds = int(callback.data.split("_")[-1])
+    except ValueError:
+        await callback.message.answer("Ошибка параметра")
+        return
+
+    active = await get_all_users(with_subscription=True)
+    await callback.message.edit_text(f"⏳ Добавляю время {len(active)} активным пользователям...")
+
+    ok = 0
+    fail = 0
+    for u in active:
+        try:
+            if await grant_time(u.telegram_id, total_seconds):
+                ok += 1
+            else:
+                fail += 1
+        except Exception as e:
+            logger.error(f"🛑 grant_time(all) error for {u.telegram_id}: {e}")
+            fail += 1
+
+    await callback.message.answer(
+        f"✅ Готово.\nДобавлено: `{ok}`\nОшибок: `{fail}`\nВсего активных: `{len(active)}`",
+        parse_mode='Markdown'
+    )
 
 # Обработчики для управления временем подписки
 @router.callback_query(F.data == "admin_add_time")
