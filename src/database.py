@@ -32,6 +32,23 @@ class StaticProfile(Base):
     vless_url = Column(String)
     created_at = Column(DateTime, default=datetime.utcnow)
 
+class Payment(Base):
+    """Запись об успешной оплате (для учёта выручки, #18).
+
+    Раньше платежи нигде не сохранялись — только уведомление админу. Теперь
+    каждый successful_payment пишется сюда. telegram_charge_id уникален —
+    защита от повторной доставки платежа Telegram (идемпотентность)."""
+    __tablename__ = 'payments'
+    id = Column(Integer, primary_key=True)
+    telegram_id = Column(Integer, index=True)
+    amount = Column(Integer)                      # в рублях (final_price)
+    currency = Column(String, default='RUB')
+    months = Column(Integer)
+    payload = Column(String)
+    telegram_charge_id = Column(String, unique=True)
+    provider_charge_id = Column(String)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
 engine = create_engine('sqlite:///users.db', echo=False)
 Session = sessionmaker(bind=engine)
 
@@ -132,3 +149,58 @@ async def get_user_stats():
         with_sub = session.query(func.count(User.id)).filter(User.subscription_end > datetime.utcnow()).scalar()
         without_sub = total - with_sub
         return total, with_sub, without_sub
+
+
+# --------------------------------------------------------------------------
+# Платежи / выручка (#18)
+# --------------------------------------------------------------------------
+
+async def record_payment(telegram_id: int, amount: int, months: int, payload: str,
+                         telegram_charge_id: str = None, provider_charge_id: str = None,
+                         currency: str = 'RUB'):
+    """Сохраняет успешный платёж. Идемпотентно по telegram_charge_id.
+
+    Возвращает (payment, is_new): is_new=False, если платёж с таким
+    telegram_charge_id уже записан (повторная доставка Telegram) — вызывающий
+    код по этому флагу НЕ начисляет время/бонусы повторно."""
+    with Session() as session:
+        if telegram_charge_id:
+            existing = session.query(Payment).filter_by(telegram_charge_id=telegram_charge_id).first()
+            if existing:
+                logger.info(f"ℹ️  Payment {telegram_charge_id} already recorded, skipping")
+                return existing, False
+        payment = Payment(
+            telegram_id=telegram_id,
+            amount=amount,
+            currency=currency,
+            months=months,
+            payload=payload,
+            telegram_charge_id=telegram_charge_id,
+            provider_charge_id=provider_charge_id,
+        )
+        session.add(payment)
+        session.commit()
+        session.refresh(payment)
+        session.expunge(payment)
+        logger.info(f"✅ Payment recorded: {telegram_id} {amount}{currency} ({months}m)")
+        return payment, True
+
+
+async def get_revenue_stats() -> dict:
+    """Сводка выручки: за сегодня, за текущий месяц и за всё время (сумма + кол-во)."""
+    now = datetime.utcnow()
+    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    with Session() as session:
+        def _sum(q):
+            return int(q.with_entities(func.coalesce(func.sum(Payment.amount), 0)).scalar() or 0)
+        def _cnt(q):
+            return int(q.with_entities(func.count(Payment.id)).scalar() or 0)
+        all_q = session.query(Payment)
+        month_q = session.query(Payment).filter(Payment.created_at >= month_start)
+        day_q = session.query(Payment).filter(Payment.created_at >= day_start)
+        return {
+            "today_total": _sum(day_q), "today_count": _cnt(day_q),
+            "month_total": _sum(month_q), "month_count": _cnt(month_q),
+            "all_total": _sum(all_q), "all_count": _cnt(all_q),
+        }

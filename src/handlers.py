@@ -13,7 +13,8 @@ from config import config
 from database import (
     StaticProfile, get_user, create_user,
     get_all_users, create_static_profile, get_static_profiles,
-    User, Session, get_user_stats as db_user_stats
+    User, Session, get_user_stats as db_user_stats,
+    record_payment, get_revenue_stats
 )
 from functions import create_vless_profile, delete_client_by_email, generate_vless_url, get_user_stats, create_static_client, get_global_stats, get_online_users, get_client_links_by_email, add_time_by_email
 from utils import _ms_to_dt, _to_epoch_ms
@@ -294,11 +295,27 @@ async def process_successful_payment(message: Message, bot: Bot):
             if not user:
                 await message.answer("❌ Ошибка: пользователь не найден")
                 return
-            
+
+            # Записываем платёж (учёт выручки, #18). Идемпотентно по charge_id:
+            # если Telegram доставил платёж повторно — не начисляем время дважды.
+            sp = message.successful_payment
+            _, is_new = await record_payment(
+                telegram_id=message.from_user.id,
+                amount=final_price,
+                months=months,
+                payload=payload,
+                telegram_charge_id=getattr(sp, "telegram_payment_charge_id", None),
+                provider_charge_id=getattr(sp, "provider_payment_charge_id", None),
+                currency=getattr(sp, "currency", "RUB"),
+            )
+            if not is_new:
+                logger.warning(f"⚠️ Duplicate payment delivery for {message.from_user.id}, skip grant")
+                return
+
             # Определяем тип действия (покупка или продление)
             now = datetime.utcnow()
             action_type = "продлена" if user.subscription_end and user.subscription_end > now else "куплена"
-            
+
             # Обновляем подписку (источник правды — панель; для без-профильных
             # юзеров срок ложится в БД и применится при «Подключить»)
             success = await grant_time(message.from_user.id, months * 30 * 24 * 60 * 60)
@@ -350,10 +367,30 @@ async def admin_menu(callback: CallbackQuery):
     builder.button(text="➕ время всем активным", callback_data="admin_add_time_all")
     builder.button(text="📋 Список пользователей", callback_data="admin_user_list")
     builder.button(text="📊 Статистика исп. сети", callback_data="admin_network_stats")
+    builder.button(text="💰 Выручка", callback_data="admin_revenue")
     builder.button(text="📢 Рассылка", callback_data="admin_send_message")
     builder.button(text="⬅️ Назад", callback_data="back_to_menu")
-    builder.adjust(2, 1, 1, 1, 1, 1)
-    
+    builder.adjust(2, 1, 1, 1, 1, 1, 1)
+
+    await callback.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode='Markdown')
+
+@router.callback_query(F.data == "admin_revenue")
+async def admin_revenue(callback: CallbackQuery):
+    user = await get_user(callback.from_user.id)
+    if not user or not user.is_admin:
+        await callback.answer("🛑 Доступ запрещен!")
+        return
+    await callback.answer()
+
+    stats = await get_revenue_stats()
+    text = (
+        "💰 **Выручка**\n\n"
+        f"**Сегодня**: `{stats['today_total']}₽` ({stats['today_count']} продаж)\n"
+        f"**За месяц**: `{stats['month_total']}₽` ({stats['month_count']} продаж)\n"
+        f"**За всё время**: `{stats['all_total']}₽` ({stats['all_count']} продаж)"
+    )
+    builder = InlineKeyboardBuilder()
+    builder.button(text="⬅️ Назад", callback_data="admin_menu")
     await callback.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode='Markdown')
 
 # Добавление времени сразу всем активным пользователям
