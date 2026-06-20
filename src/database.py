@@ -24,6 +24,8 @@ class User(Base):
     subscription_id = Column(String, unique=True)  # Уникальный ID для subscription URL
     is_admin = Column(Boolean, default=False)
     notify_stage = Column(Integer, default=0)  # 0=нет, 1=за 3д, 2=за 24ч, 3=истекло (#17)
+    referred_by = Column(Integer)              # telegram_id пригласившего (#11)
+    referral_bonus_granted = Column(Boolean, default=False)  # бонус за первую оплату выдан
 
 class StaticProfile(Base):
     __tablename__ = 'static_profiles'
@@ -98,18 +100,22 @@ async def get_user_by_subscription_id(subscription_id: str):
     with Session() as session:
         return session.query(User).filter_by(subscription_id=subscription_id).first()
 
-async def create_user(telegram_id: int, full_name: str, username: str = None, is_admin: bool = False):
+async def create_user(telegram_id: int, full_name: str, username: str = None, is_admin: bool = False,
+                      referred_by: int = None):
     with Session() as session:
         user = User(
             telegram_id=telegram_id,
             full_name=full_name,
             username=username,
             subscription_end=datetime.utcnow() + timedelta(days=3),
-            is_admin=is_admin
+            is_admin=is_admin,
+            referred_by=referred_by,
         )
         session.add(user)
         session.commit()
-        logger.info(f"✅ New user created: {telegram_id}")
+        session.refresh(user)
+        session.expunge(user)
+        logger.info(f"✅ New user created: {telegram_id}" + (f" (ref by {referred_by})" if referred_by else ""))
         return user
 
 async def delete_user_profile(telegram_id: int):
@@ -204,3 +210,36 @@ async def get_revenue_stats() -> dict:
             "month_total": _sum(month_q), "month_count": _cnt(month_q),
             "all_total": _sum(all_q), "all_count": _cnt(all_q),
         }
+
+
+# --------------------------------------------------------------------------
+# Реферальная программа (#11)
+# --------------------------------------------------------------------------
+
+async def get_referral_stats(telegram_id: int):
+    """(приглашено, из них оплатили) для пригласившего telegram_id."""
+    with Session() as session:
+        invited = session.query(func.count(User.id)).filter(User.referred_by == telegram_id).scalar()
+        paid = session.query(func.count(User.id)).filter(
+            User.referred_by == telegram_id, User.referral_bonus_granted == True
+        ).scalar()
+        return int(invited or 0), int(paid or 0)
+
+
+async def get_referrer_to_credit(telegram_id: int):
+    """Если у юзера есть пригласивший и реф-бонус ещё не начислялся (первая
+    оплата) — возвращает telegram_id пригласившего, иначе None."""
+    with Session() as session:
+        u = session.query(User).filter_by(telegram_id=telegram_id).first()
+        if u and u.referred_by and not u.referral_bonus_granted:
+            return u.referred_by
+        return None
+
+
+async def mark_referral_bonus_granted(telegram_id: int):
+    """Помечает, что за этого приглашённого реф-бонус уже выдан (идемпотентность)."""
+    with Session() as session:
+        u = session.query(User).filter_by(telegram_id=telegram_id).first()
+        if u:
+            u.referral_bonus_granted = True
+            session.commit()

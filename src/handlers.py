@@ -14,7 +14,8 @@ from database import (
     StaticProfile, get_user, create_user,
     get_all_users, create_static_profile, get_static_profiles,
     User, Session, get_user_stats as db_user_stats,
-    record_payment, get_revenue_stats
+    record_payment, get_revenue_stats,
+    get_referral_stats, get_referrer_to_credit, mark_referral_bonus_granted
 )
 from functions import create_vless_profile, delete_client_by_email, generate_vless_url, get_user_stats, create_static_client, get_global_stats, get_online_users, get_client_links_by_email, add_time_by_email
 from utils import _ms_to_dt, _to_epoch_ms
@@ -147,11 +148,12 @@ async def show_menu(bot: Bot, chat_id: int, message_id: int = None):
     builder.button(text="✅ Подключить", callback_data="connect")
     builder.button(text="📊 Статистика", callback_data="stats")
     builder.button(text="ℹ️ Помощь", callback_data="help")
-    
+    builder.button(text="👥 Пригласить друга", callback_data="referral")
+
     if user.is_admin:
         builder.button(text="⚠️ Админ. меню", callback_data="admin_menu")
-    
-    builder.adjust(2, 2, 1)
+
+    builder.adjust(2, 2, 1, 1)
     
     if message_id:
         # Редактируем существующее сообщение (inline клавиатура)
@@ -171,28 +173,58 @@ async def show_menu(bot: Bot, chat_id: int, message_id: int = None):
             parse_mode='Markdown'
         )
 
+def _parse_ref_payload(text: str, self_id: int):
+    """Достаёт telegram_id пригласившего из '/start ref_<id>'.
+    Возвращает int или None (игнорируя ссылку на самого себя/мусор)."""
+    if not text:
+        return None
+    parts = text.split(maxsplit=1)
+    if len(parts) < 2:
+        return None
+    arg = parts[1].split()[0]  # payload — один токен; берём его на всякий случай
+    if not arg.startswith("ref_"):
+        return None
+    try:
+        ref_id = int(arg[4:])
+    except ValueError:
+        return None
+    return ref_id if ref_id != self_id else None
+
+
 @router.message(Command("start"))
 async def start_cmd(message: Message, bot: Bot):
     logger.info(f"ℹ️  Start command from {message.from_user.id}")
     user = await get_user(message.from_user.id)
-    
+
     # Обновляем данные пользователя если они изменились
     if user:
         await update_user_info(user, message)
     else:
         is_admin = message.from_user.id in config.ADMINS
+        # Реферальная привязка только при ПЕРВОМ /start и если пригласивший
+        # реально существует в БД (защита от подделки чужого id).
+        ref_id = _parse_ref_payload(message.text, message.from_user.id)
+        referred_by = ref_id if (ref_id and await get_user(ref_id)) else None
         user = await create_user(
-            telegram_id=message.from_user.id, 
+            telegram_id=message.from_user.id,
             full_name=message.from_user.full_name,
             username=message.from_user.username,
-            is_admin=is_admin
+            is_admin=is_admin,
+            referred_by=referred_by,
         )
         await message.answer(
-            f"Добро пожаловать в VPN бота `{(await bot.get_me()).full_name}`!\nВам предоставлен **бесплатный** тестовый период на **3 дня**!", 
+            f"Добро пожаловать в VPN бота `{(await bot.get_me()).full_name}`!\nВам предоставлен **бесплатный** тестовый период на **3 дня**!",
             parse_mode='Markdown'
         )
+        # Приветственный бонус новичку за переход по реф-ссылке (если включён)
+        if referred_by and config.REFERRAL_NEW_USER_BONUS_DAYS > 0:
+            if await grant_time(message.from_user.id, config.REFERRAL_NEW_USER_BONUS_DAYS * 86400):
+                await message.answer(
+                    f"🎁 Вам начислен бонус **{config.REFERRAL_NEW_USER_BONUS_DAYS} дн.** за приглашение!",
+                    parse_mode='Markdown'
+                )
         await asyncio.sleep(2)
-    
+
     await show_menu(bot, message.from_user.id)
 
 
@@ -218,6 +250,27 @@ async def help_msg(callback: CallbackQuery):
         f"Если у вас возникли проблемы с подключением, обратитесь в поддержку: @xRay_support_help"
     )
     await callback.message.answer(text, parse_mode='HTML', reply_markup=builder.as_markup())
+
+@router.callback_query(F.data == "referral")
+async def referral_menu(callback: CallbackQuery, bot: Bot):
+    await callback.answer()
+    user = await get_user(callback.from_user.id)
+    if not user:
+        return
+    me = await bot.get_me()
+    link = f"https://t.me/{me.username}?start=ref_{user.telegram_id}"
+    invited, paid = await get_referral_stats(user.telegram_id)
+    text = (
+        "👥 **Реферальная программа**\n\n"
+        f"Приглашайте друзей по своей ссылке. Когда приглашённый оформит "
+        f"**первую оплату**, вы получите **{config.REFERRAL_BONUS_DAYS} дн.** подписки в подарок.\n\n"
+        f"🔗 Ваша ссылка:\n`{link}`\n\n"
+        f"**Приглашено**: `{invited}`\n"
+        f"**Оплатили (бонусов начислено)**: `{paid}`"
+    )
+    builder = InlineKeyboardBuilder()
+    builder.button(text="⬅️ Назад", callback_data="back_to_menu")
+    await callback.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode='Markdown')
 
 @router.callback_query(F.data == "renew_sub")
 async def renew_subscription(callback: CallbackQuery):
@@ -338,6 +391,22 @@ async def process_successful_payment(message: Message, bot: Bot):
                         await bot.send_message(admin_id, admin_message, parse_mode='Markdown')
                     except Exception as e:
                         logger.error(f"🛑 Failed to send notification to admin {admin_id}: {e}")
+
+                # Реферальный бонус пригласившему — только за ПЕРВУЮ оплату
+                # приглашённого (get_referrer_to_credit вернёт id один раз).
+                referrer_id = await get_referrer_to_credit(message.from_user.id)
+                if referrer_id:
+                    bonus_days = config.REFERRAL_BONUS_DAYS
+                    if await grant_time(referrer_id, bonus_days * 86400):
+                        await mark_referral_bonus_granted(message.from_user.id)
+                        try:
+                            await bot.send_message(
+                                referrer_id,
+                                f"🎉 Ваш реферал оформил подписку! Вам начислено **{bonus_days} дн.** подписки.",
+                                parse_mode='Markdown'
+                            )
+                        except Exception as e:
+                            logger.warning(f"⚠️ Referral notify failed for {referrer_id}: {e}")
             else:
                 await message.answer("❌ Ошибка при обновлении подписки")
     except Exception as e:

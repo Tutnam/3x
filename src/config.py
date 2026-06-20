@@ -33,6 +33,10 @@ class Config(BaseModel):
     SUBSCRIPTION_PORT: int = Field(default=os.getenv("SUBSCRIPTION_PORT", 35635))
     SUBSCRIPTION_BASE_URL: str = os.getenv("SUBSCRIPTION_BASE_URL", "http://localhost:35635")
 
+    # Реферальная программа (#11)
+    REFERRAL_BONUS_DAYS: int = Field(default_factory=lambda: int(os.getenv("REFERRAL_BONUS_DAYS") or 14))
+    REFERRAL_NEW_USER_BONUS_DAYS: int = Field(default_factory=lambda: int(os.getenv("REFERRAL_NEW_USER_BONUS_DAYS") or 0))
+
     # Настройки цен и скидок
     PRICES: Dict[int, Dict[str, int]] = {
         1: {"base_price": 150, "discount_percent": 0},
