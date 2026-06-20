@@ -37,6 +37,9 @@ class Config(BaseModel):
     REFERRAL_BONUS_DAYS: int = Field(default_factory=lambda: int(os.getenv("REFERRAL_BONUS_DAYS") or 14))
     REFERRAL_NEW_USER_BONUS_DAYS: int = Field(default_factory=lambda: int(os.getenv("REFERRAL_NEW_USER_BONUS_DAYS") or 0))
 
+    # Off-site бэкап: слать суточный дамп БД админам в Telegram (вкл по умолчанию)
+    BACKUP_TO_TG: bool = Field(default_factory=lambda: (os.getenv("BACKUP_TO_TG", "true").strip().lower() not in ("0", "false", "no", "off", "")))
+
     # Настройки цен и скидок
     PRICES: Dict[int, Dict[str, int]] = {
         1: {"base_price": 150, "discount_percent": 0},

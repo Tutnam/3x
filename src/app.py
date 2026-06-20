@@ -1,3 +1,4 @@
+import os
 import json
 import asyncio
 import logging
@@ -5,10 +6,11 @@ import warnings
 import coloredlogs
 from config import config
 from aiogram import Bot, Dispatcher
+from aiogram.types import FSInputFile
 from handlers import setup_handlers
 from datetime import datetime, timedelta
 from functions import get_clients_list
-from database import Session, User, init_db, get_all_users, delete_user_profile, backup_database
+from database import Session, User, init_db, get_all_users, delete_user_profile, backup_database, get_user_stats
 from subscription_server import start_subscription_server
 from utils import _ms_to_dt, UNLIMITED_END, reminder_target_stage
 
@@ -92,15 +94,39 @@ async def sync_subscriptions(bot: Bot):
 
         await asyncio.sleep(3600)
 
-async def backup_db_loop():
-    """Раз в сутки делает резервную копию users.db с ротацией на 7 дней.
+async def _send_backup_to_admins(bot: Bot, path: str):
+    """Off-site копия: отправляет файл бэкапа всем админам в Telegram.
+
+    Локальный бэкап умрёт вместе с сервером — копия в ЛС админа переживёт."""
+    try:
+        total, with_sub, _ = await get_user_stats()
+    except Exception:
+        total = with_sub = "?"
+    caption = (
+        "💾 Бэкап БД\n"
+        f"Файл: {os.path.basename(path)}\n"
+        f"Юзеров: {total} (с подпиской: {with_sub})"
+    )
+    document = FSInputFile(path)
+    for admin_id in config.ADMINS:
+        try:
+            await bot.send_document(admin_id, document, caption=caption)
+        except Exception as e:
+            logger.warning(f"⚠️ Не удалось отправить бэкап админу {admin_id}: {e}")
+
+
+async def backup_db_loop(bot: Bot):
+    """Раз в сутки делает резервную копию users.db с ротацией на 7 дней и, если
+    включено (BACKUP_TO_TG), отправляет свежий дамп админам в Telegram.
 
     Бэкап нужен потому, что БД бота — единственный источник правды по триальным
-    подпискам (которых нет в панели). Ручной бэкап остаётся в cleanup_db.py."""
+    подпискам (которых нет в панели)."""
     while True:
         try:
             path = await asyncio.to_thread(backup_database)
             logger.info(f"💾 Database backup created: {path}")
+            if config.BACKUP_TO_TG and config.ADMINS:
+                await _send_backup_to_admins(bot, path)
         except Exception as e:
             logger.warning(f"⚠️ Database backup error: {e}")
         await asyncio.sleep(24 * 60 * 60)
@@ -155,7 +181,7 @@ async def main():
     try:
         asyncio.create_task(sync_subscriptions(bot))
         asyncio.create_task(start_subscription_server())
-        asyncio.create_task(backup_db_loop())
+        asyncio.create_task(backup_db_loop(bot))
         logger.info("✅ Background tasks started")
     except Exception as e:
         logger.error(f"❌ Background tasks failed to start: {e}")
