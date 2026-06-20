@@ -26,3 +26,21 @@ def _to_epoch_ms(dt) -> int:
     if not dt:
         return 0
     return int(dt.replace(tzinfo=timezone.utc).timestamp() * 1000)
+
+
+def reminder_target_stage(left, current_stage: int):
+    """Какую стадию напоминания (#17) пора отправить при остатке `left`
+    (timedelta) и уже отправленной стадии `current_stage`.
+
+    Стадии: 1=за 3 дня, 2=за 24ч, 3=в момент/после истечения.
+    Возвращает целевую стадию (int) для отправки или None, если ничего не нужно.
+    Каждое окно срабатывает ровно один раз — за счёт сравнения с current_stage."""
+    from datetime import timedelta
+    stage = current_stage or 0
+    if left <= timedelta(0):
+        return 3 if stage < 3 else None
+    if left <= timedelta(days=1):
+        return 2 if stage < 2 else None
+    if left <= timedelta(days=3):
+        return 1 if stage < 1 else None
+    return None

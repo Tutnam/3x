@@ -82,7 +82,7 @@ async def grant_time(telegram_id: int, seconds: int) -> bool:
         if not db_user:
             return False
         db_user.subscription_end = new_end
-        db_user.notified = False
+        db_user.notify_stage = 0
         session.commit()
     return True
 

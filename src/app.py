@@ -10,13 +10,20 @@ from datetime import datetime, timedelta
 from functions import get_clients_list
 from database import Session, User, init_db, get_all_users, delete_user_profile, backup_database
 from subscription_server import start_subscription_server
-from utils import _ms_to_dt, UNLIMITED_END
+from utils import _ms_to_dt, UNLIMITED_END, reminder_target_stage
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 # Настройка логирования
 coloredlogs.install(level='info')
 logger = logging.getLogger(__name__)
+
+# Тексты ступенчатых напоминаний (#17) по стадиям notify_stage
+REMINDER_TEXTS = {
+    1: "⏳ Ваша подписка истекает через 3 дня. Продлите заранее, чтобы не потерять доступ.",
+    2: "⚠️ Ваша подписка истекает через 24 часа! Продлите подписку, чтобы сохранить доступ.",
+    3: "🛑 Ваша подписка истекла. Продлите её, чтобы восстановить доступ к VPN.",
+}
 
 
 async def sync_subscriptions(bot: Bot):
@@ -53,31 +60,33 @@ async def sync_subscriptions(bot: Bot):
                     if db_user.subscription_end != new_end:
                         db_user.subscription_end = new_end
                         changed = True
-                    # Срок далеко (>1 дня) — снимаем флаг, чтобы снова предупредить
-                    if new_end - now > timedelta(days=1) and db_user.notified:
-                        db_user.notified = False
+                    # Срок далеко (>3 дней, т.е. продлили) — сбрасываем стадию
+                    # напоминаний, чтобы заново предупредить в следующем цикле
+                    if new_end - now > timedelta(days=3) and db_user.notify_stage:
+                        db_user.notify_stage = 0
                         changed = True
                     if changed:
                         session.commit()
 
-            # 3) Предупреждение за 24ч (для всех: профильных — по зеркалу,
-            #    триальных без профиля — по их subscription_end в БД)
+            # 3) Ступенчатые напоминания: за 3 дня, за 24ч и в момент истечения.
+            #    notify_stage хранит последнюю отправленную стадию (1/2/3),
+            #    чтобы не дублировать и слать каждое окно ровно один раз.
             for user in await get_all_users():
-                if not user.subscription_end or user.notified:
+                if not user.subscription_end:
                     continue
-                if timedelta(0) < user.subscription_end - now < timedelta(days=1):
-                    try:
-                        await bot.send_message(
-                            user.telegram_id,
-                            "⚠️ Ваша подписка истекает через 24 часа! Продлите подписку, чтобы сохранить доступ."
-                        )
-                        with Session() as session:
-                            db_user = session.query(User).filter_by(telegram_id=user.telegram_id).first()
-                            if db_user:
-                                db_user.notified = True
-                                session.commit()
-                    except Exception as e:
-                        logger.warning(f"⚠️ Notification error: {e}")
+                target_stage = reminder_target_stage(user.subscription_end - now, user.notify_stage)
+                if target_stage is None:
+                    continue
+                try:
+                    await bot.send_message(user.telegram_id, REMINDER_TEXTS[target_stage])
+                    with Session() as session:
+                        db_user = session.query(User).filter_by(telegram_id=user.telegram_id).first()
+                        if db_user:
+                            db_user.notify_stage = target_stage
+                            session.commit()
+                    await asyncio.sleep(0.05)  # rate-limit рассылки напоминаний
+                except Exception as e:
+                    logger.warning(f"⚠️ Notification error: {e}")
         except Exception as e:
             logger.warning(f"⚠️ Subscription sync error: {e}")
 

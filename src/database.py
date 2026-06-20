@@ -23,7 +23,7 @@ class User(Base):
     vless_profile_data = Column(String)
     subscription_id = Column(String, unique=True)  # Уникальный ID для subscription URL
     is_admin = Column(Boolean, default=False)
-    notified = Column(Boolean, default=False)
+    notify_stage = Column(Integer, default=0)  # 0=нет, 1=за 3д, 2=за 24ч, 3=истекло (#17)
 
 class StaticProfile(Base):
     __tablename__ = 'static_profiles'
@@ -117,7 +117,7 @@ async def delete_user_profile(telegram_id: int):
         user = session.query(User).filter_by(telegram_id=telegram_id).first()
         if user:
             user.vless_profile_data = None
-            user.notified = False
+            user.notify_stage = 0
             session.commit()
             logger.info(f"✅ User profile deleted: {telegram_id}")
 
