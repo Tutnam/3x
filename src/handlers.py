@@ -16,6 +16,7 @@ from database import (
     User, Session, get_user_stats as db_user_stats
 )
 from functions import create_vless_profile, delete_client_by_email, generate_vless_url, get_user_stats, create_static_client, get_global_stats, get_online_users, get_client_links_by_email, add_time_by_email
+from utils import _ms_to_dt, _to_epoch_ms
 
 logger = logging.getLogger(__name__)
 
@@ -48,21 +49,6 @@ def format_size(bytes_count: int) -> str:
     else:
         return f"{bytes_count / 1024 / 1024 / 1024:.2f} GB"
 
-def _to_epoch_ms(dt) -> int:
-    """Naive-UTC datetime → Unix epoch в миллисекундах (0, если dt пуст)."""
-    if not dt:
-        return 0
-    return int(dt.replace(tzinfo=timezone.utc).timestamp() * 1000)
-
-def _ms_to_dt(ms):
-    """Unix epoch в мс → naive-UTC datetime. 0/пусто → дальняя дата (безлимит)."""
-    try:
-        ms = int(ms)
-    except (TypeError, ValueError):
-        ms = 0
-    if ms <= 0:
-        return datetime(2099, 1, 1)
-    return datetime.utcfromtimestamp(ms / 1000)
 
 async def grant_time(telegram_id: int, seconds: int) -> bool:
     """Изменить срок подписки на seconds (может быть отрицательным).
@@ -644,7 +630,9 @@ async def admin_send_message(message: Message, state: FSMContext, bot: Bot):
     
     success = 0
     failed = 0
-    
+
+    # Telegram ограничивает рассылку ~30 сообщений/сек. Пауза между отправками
+    # держит нас ниже лимита, чтобы не ловить 429 и не терять часть получателей.
     for user in users:
         try:
             await bot.send_message(user.telegram_id, text)
@@ -652,7 +640,8 @@ async def admin_send_message(message: Message, state: FSMContext, bot: Bot):
         except Exception as e:
             logger.error(f"🛑 Ошибка отправки сообщения {user.telegram_id}: {e}")
             failed += 1
-    
+        await asyncio.sleep(0.05)  # ~20 msg/s, безопасный запас под лимитом
+
     await message.answer(
         f"📨 Результаты рассылки:\n\n"
         f"• Успешно: {success}\n"

@@ -2,8 +2,13 @@ from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean
 from sqlalchemy.orm import declarative_base, sessionmaker
 from datetime import datetime, timedelta
 import logging
+import os
+import glob
+import sqlite3
 
 logger = logging.getLogger(__name__)
+
+DB_PATH = 'users.db'
 
 Base = declarative_base()
 
@@ -33,6 +38,39 @@ Session = sessionmaker(bind=engine)
 async def init_db():
     Base.metadata.create_all(engine)
     logger.info("✅ Database tables created")
+
+
+def backup_database(backup_dir: str = "backups", keep: int = 7) -> str:
+    """Создаёт согласованную копию users.db через SQLite backup API
+    (безопасно даже при активной записи) и оставляет последние `keep` копий.
+
+    Возвращает путь к созданному бэкапу. Запускать через asyncio.to_thread —
+    операция блокирующая.
+    """
+    os.makedirs(backup_dir, exist_ok=True)
+    stamp = datetime.utcnow().strftime("%Y%m%d")
+    dest = os.path.join(backup_dir, f"users.db.{stamp}")
+
+    src = sqlite3.connect(DB_PATH)
+    try:
+        dst = sqlite3.connect(dest)
+        try:
+            with dst:
+                src.backup(dst)
+        finally:
+            dst.close()
+    finally:
+        src.close()
+
+    # Ротация: оставляем только `keep` самых свежих бэкапов
+    backups = sorted(glob.glob(os.path.join(backup_dir, "users.db.*")))
+    for old in backups[:-keep]:
+        try:
+            os.remove(old)
+        except OSError as e:
+            logger.warning(f"⚠️ Failed to remove old backup {old}: {e}")
+
+    return dest
 
 async def get_user(telegram_id: int):
     with Session() as session:

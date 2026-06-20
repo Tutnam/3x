@@ -41,6 +41,10 @@ env/
 # Database
 *.db
 *.sqlite3
+*.bak
+*.bak_*
+*.bak[0-9]*
+backups/
 
 # Logs
 *.log

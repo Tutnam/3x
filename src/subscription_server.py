@@ -5,7 +5,7 @@ from aiohttp import web
 from datetime import datetime
 from config import config
 from database import get_user_by_subscription_id
-from functions import get_client_links_by_email
+from functions import get_client_links_by_email, get_client_traffic_by_email
 
 logger = logging.getLogger(__name__)
 
@@ -73,16 +73,23 @@ async def handle_subscription(request):
         payload = "\n".join(links)
         encoded = base64.b64encode(payload.encode('utf-8')).decode('utf-8')
         logger.info(f"✅ Encoded successfully. Length: {len(encoded)} bytes")
-        
+
+        # Реальный трафик клиента — чтобы приложения показывали потребление.
+        # total=0 означает «безлимит» (клиенты так и трактуют этот хедер).
+        traffic = await get_client_traffic_by_email(email)
+        upload = int(traffic.get("upload", 0) or 0)
+        download = int(traffic.get("download", 0) or 0)
+        logger.info(f"✅ Traffic for {email}: up={upload}, down={download}")
+
         logger.info(f"✅ Subscription served for user {user.telegram_id}")
-        
+
         # Возвращаем в формате base64
         return web.Response(
             text=encoded,
             content_type='text/plain',
             charset='utf-8',
             headers={
-                'Subscription-Userinfo': f'upload=0; download=0; total=0; expire={int(user.subscription_end.timestamp())}',
+                'Subscription-Userinfo': f'upload={upload}; download={download}; total=0; expire={int(user.subscription_end.timestamp())}',
                 'Profile-Update-Interval': '24',  # Обновлять раз в 24 часа
                 'Profile-Title': f'VPN - {user.full_name}'
             }

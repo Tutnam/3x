@@ -8,27 +8,15 @@ from aiogram import Bot, Dispatcher
 from handlers import setup_handlers
 from datetime import datetime, timedelta
 from functions import get_clients_list
-from database import Session, User, init_db, get_all_users, delete_user_profile
+from database import Session, User, init_db, get_all_users, delete_user_profile, backup_database
 from subscription_server import start_subscription_server
+from utils import _ms_to_dt, UNLIMITED_END
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 # Настройка логирования
 coloredlogs.install(level='info')
 logger = logging.getLogger(__name__)
-
-UNLIMITED_END = datetime(2099, 1, 1)  # зеркало безлимита (expiryTime == 0)
-
-
-def _ms_to_dt(ms):
-    """Unix epoch в мс → naive-UTC datetime. 0/пусто → дальняя дата (безлимит)."""
-    try:
-        ms = int(ms)
-    except (TypeError, ValueError):
-        ms = 0
-    if ms <= 0:
-        return UNLIMITED_END
-    return datetime.utcfromtimestamp(ms / 1000)
 
 
 async def sync_subscriptions(bot: Bot):
@@ -95,6 +83,20 @@ async def sync_subscriptions(bot: Bot):
 
         await asyncio.sleep(3600)
 
+async def backup_db_loop():
+    """Раз в сутки делает резервную копию users.db с ротацией на 7 дней.
+
+    Бэкап нужен потому, что БД бота — единственный источник правды по триальным
+    подпискам (которых нет в панели). Ручной бэкап остаётся в cleanup_db.py."""
+    while True:
+        try:
+            path = await asyncio.to_thread(backup_database)
+            logger.info(f"💾 Database backup created: {path}")
+        except Exception as e:
+            logger.warning(f"⚠️ Database backup error: {e}")
+        await asyncio.sleep(24 * 60 * 60)
+
+
 async def update_admins_status():
     """Обновляет статус администраторов в базе данных"""
     with Session() as session:
@@ -144,6 +146,7 @@ async def main():
     try:
         asyncio.create_task(sync_subscriptions(bot))
         asyncio.create_task(start_subscription_server())
+        asyncio.create_task(backup_db_loop())
         logger.info("✅ Background tasks started")
     except Exception as e:
         logger.error(f"❌ Background tasks failed to start: {e}")

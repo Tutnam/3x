@@ -84,6 +84,10 @@ class XUIAPI:
         задан, делаем fallback на логин по username/password (cookie-сессия).
         """
         try:
+            # Закрываем старую сессию, если осталась (повторный login на синглтоне)
+            if self.session and not self.session.closed:
+                await self.session.close()
+
             # Создаём новую сессию с общей куки-банкой
             self.session = aiohttp.ClientSession(
                 cookie_jar=self.cookie_jar,
@@ -533,10 +537,9 @@ class XUIAPI:
         }
 
     async def create_vless_profile(self, telegram_id: int, expiry_ms: int = 0):
-        """Создание профиля для пользователя бота (expiry_ms — срок в мс, 0=безлимит)."""
-        if not await self.login():
-            logger.error("🛑 Login failed before creating profile")
-            return None
+        """Создание профиля для пользователя бота (expiry_ms — срок в мс, 0=безлимит).
+
+        Сессия гарантируется вызывающей обёрткой (_get_api), отдельный login не нужен."""
         email = f"user_{telegram_id}_{random.randint(1000, 9999)}"
         profile = await self._create_client(email, telegram_id=telegram_id, expiry_ms=expiry_ms)
         if profile:
@@ -546,10 +549,9 @@ class XUIAPI:
         return profile
 
     async def create_static_client(self, profile_name: str, expiry_ms: int = 0):
-        """Создание статического клиента (имя = email; expiry_ms 0=безлимит)."""
-        if not await self.login():
-            logger.error("🛑 Login failed before creating static client")
-            return None
+        """Создание статического клиента (имя = email; expiry_ms 0=безлимит).
+
+        Сессия гарантируется вызывающей обёрткой (_get_api)."""
         profile = await self._create_client(profile_name, telegram_id=0, expiry_ms=expiry_ms)
         if profile:
             logger.info(f"✅ Created static client: {profile_name}")
@@ -558,10 +560,9 @@ class XUIAPI:
         return profile
 
     async def get_user_stats(self, email: str):
-        """Статистика по email (совместимость со старым API хендлеров)."""
-        if not await self.login():
-            logger.error("🛑 Login failed before getting stats")
-            return {"upload": 0, "download": 0}
+        """Статистика по email (совместимость со старым API хендлеров).
+
+        Сессия гарантируется вызывающей обёрткой (_get_api)."""
         return await self.get_client_traffic(email)
 
     async def close(self):
@@ -570,127 +571,122 @@ class XUIAPI:
 
 
 # --------------------------------------------------------------------------
+# Переиспользуемый singleton-клиент
+# --------------------------------------------------------------------------
+# Раньше каждая обёртка создавала новый XUIAPI(), логинилась, делала 1 запрос
+# и закрывала сессию. На массовых операциях («+ время всем активным») это N
+# последовательных логинов подряд. Теперь держим один клиент с одной aiohttp-
+# сессией; login выполняется лениво и переигрывается, если сессия отвалилась.
+
+_shared_api: "XUIAPI | None" = None
+_login_lock = asyncio.Lock()
+
+
+async def _get_api() -> "XUIAPI | None":
+    """Возвращает залогиненный singleton-клиент (или None, если login не удался)."""
+    global _shared_api
+    api = _shared_api
+    if api is not None and api.session is not None and not api.session.closed:
+        return api
+    async with _login_lock:
+        # Повторная проверка под локом: другой таск мог уже залогиниться
+        api = _shared_api
+        if api is not None and api.session is not None and not api.session.closed:
+            return api
+        api = XUIAPI()
+        if not await api.login():
+            await api.close()
+            _shared_api = None
+            return None
+        _shared_api = api
+        return _shared_api
+
+
+async def _invalidate():
+    """Сбрасывает кэш сессии — следующий вызов выполнит свежий login."""
+    global _shared_api
+    api = _shared_api
+    _shared_api = None
+    if api is not None:
+        await api.close()
+
+
+async def _call(op, default):
+    """Выполняет операцию `op(api)` на singleton с одним повтором после
+    переподключения, если сессия отвалилась (закрытая сессия / сетевой сбой)."""
+    for attempt in (1, 2):
+        api = await _get_api()
+        if api is None:
+            return default
+        try:
+            return await op(api)
+        except (aiohttp.ClientError, RuntimeError) as e:
+            logger.warning(f"⚠️ API call failed (attempt {attempt}): {e}")
+            await _invalidate()
+    return default
+
+
+# --------------------------------------------------------------------------
 # Публичные функции-обёртки (контракт для handlers.py / app.py / subscription_server.py)
 # --------------------------------------------------------------------------
 
 async def create_vless_profile(telegram_id: int, expiry_ms: int = 0):
-    api = XUIAPI()
-    try:
-        return await api.create_vless_profile(telegram_id, expiry_ms=expiry_ms)
-    finally:
-        await api.close()
+    return await _call(lambda api: api.create_vless_profile(telegram_id, expiry_ms=expiry_ms), None)
 
 
 async def create_static_client(profile_name: str, expiry_ms: int = 0):
-    api = XUIAPI()
-    try:
-        return await api.create_static_client(profile_name, expiry_ms=expiry_ms)
-    finally:
-        await api.close()
+    return await _call(lambda api: api.create_static_client(profile_name, expiry_ms=expiry_ms), None)
 
 
 async def set_client_subscription_by_email(email: str, expiry_ms: int, enable: bool = True):
     """Синхронизировать срок (мс) и состояние клиента в панели."""
-    api = XUIAPI()
-    try:
-        if not await api.login():
-            return False
-        return await api.set_client_subscription(email, expiry_ms, enable=enable)
-    finally:
-        await api.close()
+    return await _call(lambda api: api.set_client_subscription(email, expiry_ms, enable=enable), False)
 
 
 async def add_time_by_email(email: str, seconds: int):
     """Добавить/списать время клиенту в панели (read-modify-write expiryTime).
 
     Возвращает новый expiry_ms или None при ошибке."""
-    api = XUIAPI()
-    try:
-        if not await api.login():
-            return None
-        return await api.add_time(email, seconds)
-    finally:
-        await api.close()
+    return await _call(lambda api: api.add_time(email, seconds), None)
 
 
 async def get_clients_list():
     """Список всех клиентов панели (для зеркалирования срока в БД бота)."""
-    api = XUIAPI()
-    try:
-        if not await api.login():
-            return []
-        return await api.get_clients_list()
-    finally:
-        await api.close()
+    return await _call(lambda api: api.get_clients_list(), [])
 
 
 async def delete_client_by_email(email: str):
-    api = XUIAPI()
-    try:
-        if not await api.login():
-            return False
-        return await api.delete_client(email)
-    finally:
-        await api.close()
+    return await _call(lambda api: api.delete_client(email), False)
 
 
 async def enable_client_by_email(email: str):
-    api = XUIAPI()
-    try:
-        if not await api.login():
-            return False
-        return await api.toggle_client(email, enable=True)
-    finally:
-        await api.close()
+    return await _call(lambda api: api.toggle_client(email, enable=True), False)
 
 
 async def disable_client_by_email(email: str):
-    api = XUIAPI()
-    try:
-        if not await api.login():
-            return False
-        return await api.toggle_client(email, enable=False)
-    finally:
-        await api.close()
+    return await _call(lambda api: api.toggle_client(email, enable=False), False)
 
 
 async def get_global_stats():
-    api = XUIAPI()
-    try:
-        if not await api.login():
-            return {"upload": 0, "download": 0}
-        return await api.get_global_stats()
-    finally:
-        await api.close()
+    return await _call(lambda api: api.get_global_stats(), {"upload": 0, "download": 0})
 
 
 async def get_online_users():
-    api = XUIAPI()
-    try:
-        if not await api.login():
-            return 0
-        return await api.get_online_users()
-    finally:
-        await api.close()
+    return await _call(lambda api: api.get_online_users(), 0)
 
 
 async def get_user_stats(email: str):
-    api = XUIAPI()
-    try:
-        return await api.get_user_stats(email)
-    finally:
-        await api.close()
+    return await _call(lambda api: api.get_user_stats(email), {"upload": 0, "download": 0})
 
 
 async def get_client_links_by_email(email: str) -> list:
     """Готовые ссылки клиента (все инбаунды/протоколы) от панели v3.2.0."""
-    api = XUIAPI()
-    try:
-        if not await api.login():
-            return []
-        return await api.get_client_links(email)
-    finally:
-        await api.close()
+    return await _call(lambda api: api.get_client_links(email), [])
+
+
+async def get_client_traffic_by_email(email: str) -> dict:
+    """Реальный трафик клиента {upload, download} (для Subscription-Userinfo)."""
+    return await _call(lambda api: api.get_client_traffic(email), {"upload": 0, "download": 0})
 
 
 def generate_vless_url(profile_data: dict) -> str:
