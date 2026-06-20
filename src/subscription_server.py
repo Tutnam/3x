@@ -99,9 +99,16 @@ async def handle_subscription(request):
         logger.exception(f"🛑 Subscription error: {e}")
         return web.Response(text="Internal server error", status=500)
 
+async def handle_health(request):
+    """Liveness-проба для Docker/мониторинга: 200, если процесс жив и loop крутится."""
+    return web.json_response({"status": "ok"})
+
 async def start_subscription_server():
     """Запуск HTTP сервера для subscription URL"""
     app = web.Application()
+    # /health регистрируем ДО catch-all '/{subscription_id}', иначе healthcheck
+    # уйдёт в обработчик подписки и вернёт 404.
+    app.router.add_get('/health', handle_health)
     app.router.add_get('/{subscription_id}', handle_subscription)
     
     runner = web.AppRunner(app)

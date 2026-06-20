@@ -1,0 +1,50 @@
+services:
+  bot:
+    build: .
+    container_name: vpn-bot
+    # Авто-рестарт при краше И автостарт после перезагрузки сервера.
+    # Это заменяет screen + cron @reboot и закрывает главную проблему — падения.
+    restart: unless-stopped
+
+    # Конфиг берём из существующего src/.env (там же, откуда его читает бот).
+    # Переменные попадают в окружение контейнера, os.getenv их видит.
+    env_file:
+      - ./src/.env
+
+    # Подписочный сервер слушает SUBSCRIPTION_PORT (дефолт 35635) внутри контейнера.
+    # Публикуем ТОЛЬКО на localhost хоста — наружу его уже отдаёт внешний
+    # reverse-proxy (как сейчас: https://rus.vlip.ru.net/FPtzhP2oo1 -> 127.0.0.1:35635).
+    # Если задашь SUBSCRIPTION_PORT в .env — поменяй оба числа ниже.
+    ports:
+      - "127.0.0.1:35635:35635"
+
+    # Персистентность: и живая БД, и авто-бэкапы лежат на ХОСТЕ и переживают
+    # пересборку/пересоздание контейнера (docker compose up --build и т.п.).
+    volumes:
+      - ./users.db:/app/users.db
+      - ./backups:/app/backups
+
+    # Liveness: Docker дёргает /health; при 3 неудачах подряд контейнер
+    # помечается unhealthy (видно в `docker ps`).
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:35635/health', timeout=5).status==200 else 1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+# --- Сеть до панели 3x-UI -----------------------------------------------------
+# Панель в контейнер НЕ заворачивается. Бот ходит в неё по XUI_API_URL.
+# Сейчас XUI_API_URL=https://rus.vlip.ru.net — ПУБЛИЧНЫЙ домен, поэтому
+# контейнер на стандартной bridge-сети достучится до него без какой-либо
+# доп. настройки. Ничего делать не нужно.
+#
+# Если когда-нибудь панель будет на ЭТОМ ЖЕ хосте по localhost
+# (напр. XUI_API_URL=http://127.0.0.1:54321), то изнутри контейнера localhost —
+# это сам контейнер, а не хост. Тогда один из вариантов:
+#   1) добавить боту доступ к хосту:
+#        extra_hosts:
+#          - "host.docker.internal:host-gateway"
+#      и в .env указать XUI_API_URL=http://host.docker.internal:54321
+#   2) либо network_mode: host (тогда блок ports выше не нужен — порт
+#      биндится на хост напрямую; только Linux).
