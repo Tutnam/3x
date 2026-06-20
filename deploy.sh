@@ -83,6 +83,25 @@ if command -v systemctl >/dev/null 2>&1; then
     $SUDO systemctl enable --now docker 2>/dev/null || true
 fi
 
+# Ручная установка плагина docker compose v2 с GitHub-релизов.
+# Нужна там, где нет репозитория Docker (напр. Docker из пакета Ubuntu docker.io):
+# тогда apt-пакета docker-compose-plugin не существует, остаётся только бинарь.
+install_compose_plugin() {
+    command -v curl >/dev/null 2>&1 || pkg_install curl
+    local arch; arch="$(uname -m)"
+    case "$arch" in
+        x86_64|amd64)   arch="x86_64" ;;
+        aarch64|arm64)  arch="aarch64" ;;
+        armv7l)         arch="armv7" ;;
+        *) log "⚠️  Неизвестная архитектура $arch для плагина compose"; return 1 ;;
+    esac
+    local dir="/usr/local/lib/docker/cli-plugins"
+    $SUDO mkdir -p "$dir"
+    $SUDO curl -SL "https://github.com/docker/compose/releases/latest/download/docker-compose-linux-${arch}" \
+        -o "$dir/docker-compose" || return 1
+    $SUDO chmod +x "$dir/docker-compose"
+}
+
 # Определяем команду compose: v2 (docker compose) предпочтительно, иначе legacy
 if docker compose version >/dev/null 2>&1; then
     COMPOSE="docker compose"
@@ -90,7 +109,12 @@ elif command -v docker-compose >/dev/null 2>&1; then
     COMPOSE="docker-compose"
 else
     log "Плагин docker compose не найден — ставлю..."
-    pkg_install docker-compose-plugin 2>/dev/null || pkg_install docker-compose || true
+    # 1) пробуем штатный пакет (есть только при подключённом репо Docker)
+    pkg_install docker-compose-plugin 2>/dev/null || true
+    # 2) если не вышло — ручной бинарь плагина с GitHub
+    docker compose version >/dev/null 2>&1 || install_compose_plugin || true
+    # 3) последний фолбэк — legacy docker-compose из пакетов
+    docker compose version >/dev/null 2>&1 || pkg_install docker-compose 2>/dev/null || true
     if docker compose version >/dev/null 2>&1; then COMPOSE="docker compose"
     elif command -v docker-compose >/dev/null 2>&1; then COMPOSE="docker-compose"
     else die "Не удалось получить docker compose"

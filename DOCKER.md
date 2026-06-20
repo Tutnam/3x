@@ -10,6 +10,18 @@
   - `users.db` — живая база (монтируется в контейнер);
   - папка `backups/` (создастся сама, если её нет).
 
+> **Нет `docker compose`?** На Ubuntu с Docker из пакета `docker.io` плагина v2
+> нет, а `apt install docker-compose-plugin` падает с `Unable to locate package`
+> (нужен репозиторий Docker). `deploy.sh` ставит плагин сам, но вручную это так:
+> ```bash
+> mkdir -p /usr/local/lib/docker/cli-plugins
+> curl -SL https://github.com/docker/compose/releases/latest/download/docker-compose-linux-x86_64 \
+>   -o /usr/local/lib/docker/cli-plugins/docker-compose
+> chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+> docker compose version   # проверка
+> ```
+> Для ARM замени `x86_64` на `aarch64`.
+
 ## Перенос на новый сервер
 Порядок важен: `src/.env` и `users.db` нужно положить **до** `deploy.sh`.
 
