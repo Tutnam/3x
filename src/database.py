@@ -1,4 +1,4 @@
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean, func, or_
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean, func, or_, UniqueConstraint
 from sqlalchemy.orm import declarative_base, sessionmaker
 from datetime import datetime, timedelta
 import logging
@@ -50,6 +50,27 @@ class Payment(Base):
     telegram_charge_id = Column(String, unique=True)
     provider_charge_id = Column(String)
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+class PromoCode(Base):
+    """Промокод на бонусные дни подписки (#12)."""
+    __tablename__ = 'promo_codes'
+    id = Column(Integer, primary_key=True)
+    code = Column(String, unique=True, index=True)
+    bonus_days = Column(Integer)
+    max_activations = Column(Integer, default=0)   # 0 = безлимит
+    activations = Column(Integer, default=0)
+    expires_at = Column(DateTime, nullable=True)   # None = бессрочно
+    active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class PromoRedemption(Base):
+    """Факт активации промокода юзером — не более одного раза на код (#12)."""
+    __tablename__ = 'promo_redemptions'
+    id = Column(Integer, primary_key=True)
+    code = Column(String, index=True)
+    telegram_id = Column(Integer, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    __table_args__ = (UniqueConstraint('code', 'telegram_id', name='uq_promo_user'),)
 
 engine = create_engine('sqlite:///users.db', echo=False)
 Session = sessionmaker(bind=engine)
@@ -243,3 +264,72 @@ async def mark_referral_bonus_granted(telegram_id: int):
         if u:
             u.referral_bonus_granted = True
             session.commit()
+
+
+# --------------------------------------------------------------------------
+# Промокоды (#12)
+# --------------------------------------------------------------------------
+
+async def create_promo(code: str, bonus_days: int, max_activations: int = 0, expires_in_days: int = None):
+    """Создаёт промокод. Возвращает PromoCode или None, если код уже существует."""
+    code = (code or '').strip()
+    with Session() as session:
+        if session.query(PromoCode).filter(func.lower(PromoCode.code) == code.lower()).first():
+            return None
+        expires_at = (datetime.utcnow() + timedelta(days=expires_in_days)) if expires_in_days else None
+        promo = PromoCode(code=code, bonus_days=bonus_days,
+                          max_activations=max_activations or 0, expires_at=expires_at)
+        session.add(promo)
+        session.commit()
+        session.refresh(promo)
+        session.expunge(promo)
+        return promo
+
+
+async def redeem_promo(code: str, telegram_id: int):
+    """Атомарно проверяет и «забирает» одну активацию промокода.
+
+    Возвращает (status, bonus_days, canonical_code):
+      status: 'ok' | 'not_found' | 'inactive' | 'expired' | 'limit' | 'already'.
+    При 'ok' активация уже записана (и счётчик увеличен) — вызывающий код
+    начисляет дни; при сбое начисления должен вызвать rollback_redemption."""
+    code_in = (code or '').strip()
+    if not code_in:
+        return 'not_found', 0, None
+    with Session() as session:
+        promo = session.query(PromoCode).filter(func.lower(PromoCode.code) == code_in.lower()).first()
+        if not promo:
+            return 'not_found', 0, None
+        if not promo.active:
+            return 'inactive', 0, promo.code
+        if promo.expires_at and promo.expires_at < datetime.utcnow():
+            return 'expired', 0, promo.code
+        if promo.max_activations and promo.activations >= promo.max_activations:
+            return 'limit', 0, promo.code
+        if session.query(PromoRedemption).filter_by(code=promo.code, telegram_id=telegram_id).first():
+            return 'already', 0, promo.code
+        session.add(PromoRedemption(code=promo.code, telegram_id=telegram_id))
+        promo.activations = (promo.activations or 0) + 1
+        session.commit()
+        return 'ok', promo.bonus_days, promo.code
+
+
+async def rollback_redemption(code: str, telegram_id: int):
+    """Откатывает активацию (если начисление дней не удалось)."""
+    with Session() as session:
+        r = session.query(PromoRedemption).filter_by(code=code, telegram_id=telegram_id).first()
+        if r:
+            session.delete(r)
+            promo = session.query(PromoCode).filter_by(code=code).first()
+            if promo and promo.activations:
+                promo.activations -= 1
+            session.commit()
+
+
+async def list_promos():
+    """Все промокоды (свежие сверху) для админки."""
+    with Session() as session:
+        promos = session.query(PromoCode).order_by(PromoCode.created_at.desc()).all()
+        for p in promos:
+            session.expunge(p)
+        return promos

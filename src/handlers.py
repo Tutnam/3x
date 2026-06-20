@@ -15,7 +15,8 @@ from database import (
     get_all_users, create_static_profile, get_static_profiles,
     User, Session, get_user_stats as db_user_stats,
     record_payment, get_revenue_stats,
-    get_referral_stats, get_referrer_to_credit, mark_referral_bonus_granted
+    get_referral_stats, get_referrer_to_credit, mark_referral_bonus_granted,
+    create_promo, redeem_promo, rollback_redemption, list_promos
 )
 from functions import create_vless_profile, delete_client_by_email, generate_vless_url, get_user_stats, create_static_client, get_global_stats, get_online_users, get_client_links_by_email, add_time_by_email
 from utils import _ms_to_dt, _to_epoch_ms
@@ -37,6 +38,13 @@ class AdminStates(StatesGroup):
     REMOVE_TIME_AMOUNT = State()
     ADD_TIME_ALL_AMOUNT = State()
     SEND_MESSAGE_TARGET = State()
+    PROMO_CODE = State()
+    PROMO_DAYS = State()
+    PROMO_LIMIT = State()
+    PROMO_EXPIRY = State()
+
+class UserStates(StatesGroup):
+    REDEEM_PROMO = State()
 
 
 
@@ -149,11 +157,12 @@ async def show_menu(bot: Bot, chat_id: int, message_id: int = None):
     builder.button(text="📊 Статистика", callback_data="stats")
     builder.button(text="ℹ️ Помощь", callback_data="help")
     builder.button(text="👥 Пригласить друга", callback_data="referral")
+    builder.button(text="🎁 Промокод", callback_data="promo_redeem")
 
     if user.is_admin:
         builder.button(text="⚠️ Админ. меню", callback_data="admin_menu")
 
-    builder.adjust(2, 2, 1, 1)
+    builder.adjust(2, 2, 1, 1, 1)
     
     if message_id:
         # Редактируем существующее сообщение (inline клавиатура)
@@ -271,6 +280,34 @@ async def referral_menu(callback: CallbackQuery, bot: Bot):
     builder = InlineKeyboardBuilder()
     builder.button(text="⬅️ Назад", callback_data="back_to_menu")
     await callback.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode='Markdown')
+
+@router.callback_query(F.data == "promo_redeem")
+async def promo_redeem_start(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await callback.message.answer("🎁 Введите промокод:")
+    await state.set_state(UserStates.REDEEM_PROMO)
+
+@router.message(UserStates.REDEEM_PROMO)
+async def promo_redeem_apply(message: Message, state: FSMContext, bot: Bot):
+    await state.clear()
+    status, days, canon = await redeem_promo(message.text, message.from_user.id)
+    if status != "ok":
+        msgs = {
+            "not_found": "❌ Промокод не найден.",
+            "inactive": "❌ Промокод неактивен.",
+            "expired": "❌ Срок действия промокода истёк.",
+            "limit": "❌ Лимит активаций промокода исчерпан.",
+            "already": "❌ Вы уже активировали этот промокод.",
+        }
+        await message.answer(msgs.get(status, "❌ Не удалось активировать промокод."))
+        return
+    if await grant_time(message.from_user.id, days * 86400):
+        await message.answer(f"✅ Промокод активирован! Вам начислено **{days} дн.** подписки.", parse_mode='Markdown')
+    else:
+        # начисление не удалось — откатываем активацию, чтобы код можно было ввести снова
+        await rollback_redemption(canon, message.from_user.id)
+        await message.answer("❌ Не удалось начислить дни, попробуйте позже.")
+    await show_menu(bot, message.from_user.id)
 
 @router.callback_query(F.data == "renew_sub")
 async def renew_subscription(callback: CallbackQuery):
@@ -437,9 +474,10 @@ async def admin_menu(callback: CallbackQuery):
     builder.button(text="📋 Список пользователей", callback_data="admin_user_list")
     builder.button(text="📊 Статистика исп. сети", callback_data="admin_network_stats")
     builder.button(text="💰 Выручка", callback_data="admin_revenue")
+    builder.button(text="🎁 Промокоды", callback_data="admin_promos")
     builder.button(text="📢 Рассылка", callback_data="admin_send_message")
     builder.button(text="⬅️ Назад", callback_data="back_to_menu")
-    builder.adjust(2, 1, 1, 1, 1, 1, 1)
+    builder.adjust(2, 1, 1, 1, 1, 1, 1, 1)
 
     await callback.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode='Markdown')
 
@@ -461,6 +499,103 @@ async def admin_revenue(callback: CallbackQuery):
     builder = InlineKeyboardBuilder()
     builder.button(text="⬅️ Назад", callback_data="admin_menu")
     await callback.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode='Markdown')
+
+# --- Промокоды (админ) ---
+@router.callback_query(F.data == "admin_promos")
+async def admin_promos(callback: CallbackQuery):
+    user = await get_user(callback.from_user.id)
+    if not user or not user.is_admin:
+        await callback.answer("🛑 Доступ запрещен!")
+        return
+    await callback.answer()
+    promos = await list_promos()
+    if promos:
+        lines = []
+        for p in promos:
+            limit = "∞" if not p.max_activations else p.max_activations
+            exp = p.expires_at.strftime("%d-%m-%Y") if p.expires_at else "бессрочно"
+            st = "🟢" if p.active else "🔴"
+            lines.append(f"{st} `{p.code}` — {p.bonus_days}д | {p.activations}/{limit} | до {exp}")
+        text = "🎁 **Промокоды**\n\n" + "\n".join(lines)
+    else:
+        text = "🎁 **Промокоды**\n\nПока нет ни одного промокода."
+    builder = InlineKeyboardBuilder()
+    builder.button(text="➕ Создать", callback_data="admin_promo_create")
+    builder.button(text="⬅️ Назад", callback_data="admin_menu")
+    builder.adjust(1)
+    await callback.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode='Markdown')
+
+@router.callback_query(F.data == "admin_promo_create")
+async def admin_promo_create_start(callback: CallbackQuery, state: FSMContext):
+    user = await get_user(callback.from_user.id)
+    if not user or not user.is_admin:
+        await callback.answer("🛑 Доступ запрещен!")
+        return
+    await callback.answer()
+    await callback.message.answer("Введите код промокода (напр. `SUMMER2026`):", parse_mode='Markdown')
+    await state.set_state(AdminStates.PROMO_CODE)
+
+@router.message(AdminStates.PROMO_CODE)
+async def admin_promo_code(message: Message, state: FSMContext):
+    code = (message.text or "").strip()
+    if not code or " " in code:
+        await message.answer("Код не должен быть пустым или содержать пробелы. Введите код:")
+        return
+    await state.update_data(promo_code=code)
+    await message.answer("Сколько дней подписки даёт код? (число):")
+    await state.set_state(AdminStates.PROMO_DAYS)
+
+@router.message(AdminStates.PROMO_DAYS)
+async def admin_promo_days(message: Message, state: FSMContext):
+    try:
+        days = int((message.text or "").strip())
+        if days <= 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("Введите положительное число дней:")
+        return
+    await state.update_data(promo_days=days)
+    await message.answer("Лимит активаций (`0` — без лимита):", parse_mode='Markdown')
+    await state.set_state(AdminStates.PROMO_LIMIT)
+
+@router.message(AdminStates.PROMO_LIMIT)
+async def admin_promo_limit(message: Message, state: FSMContext):
+    try:
+        limit = int((message.text or "").strip())
+        if limit < 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("Введите неотрицательное число (`0` — без лимита):", parse_mode='Markdown')
+        return
+    await state.update_data(promo_limit=limit)
+    await message.answer("Срок действия в днях (`0` — бессрочно):", parse_mode='Markdown')
+    await state.set_state(AdminStates.PROMO_EXPIRY)
+
+@router.message(AdminStates.PROMO_EXPIRY)
+async def admin_promo_expiry(message: Message, state: FSMContext):
+    try:
+        exp = int((message.text or "").strip())
+        if exp < 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("Введите неотрицательное число дней (`0` — бессрочно):", parse_mode='Markdown')
+        return
+    data = await state.get_data()
+    await state.clear()
+    promo = await create_promo(
+        code=data["promo_code"],
+        bonus_days=data["promo_days"],
+        max_activations=data["promo_limit"],
+        expires_in_days=exp or None,
+    )
+    if not promo:
+        await message.answer(f"❌ Промокод `{data['promo_code']}` уже существует.", parse_mode='Markdown')
+        return
+    await message.answer(
+        f"✅ Промокод создан:\n`{promo.code}` — {promo.bonus_days} дн.\n"
+        f"Лимит: {promo.max_activations or '∞'} | Срок: {exp or 'бессрочно'} дн.",
+        parse_mode='Markdown'
+    )
 
 # Добавление времени сразу всем активным пользователям
 @router.callback_query(F.data == "admin_add_time_all")
